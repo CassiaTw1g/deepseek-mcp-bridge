@@ -1,0 +1,101 @@
+name: Bug report
+description: Something isn't working as documented
+title: "bug: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please do **not** include your
+        `DEEPSEEK_API_KEY`, your `MCP_PATH_SECRET`, or your public tunnel URL in
+        this report — redact them.
+
+        For a security vulnerability, stop and use the process in SECURITY.md
+        instead of filing a public issue.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: A clear description of the bug, including the exact error text if any.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps. Include the command you ran, with secrets redacted.
+      placeholder: |
+        1. npm run start
+        2. npm run tunnel
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Release tag, or the output of `git rev-parse --short HEAD`.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: input
+    id: node
+    attributes:
+      label: Node.js version
+      description: Output of `node --version`. Must be >= 24.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deploy
+    attributes:
+      label: How is the endpoint exposed?
+      options:
+        - cloudflared quick tunnel
+        - Cloudflare Worker
+        - VPS / direct
+        - Local only (no tunnel)
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Output of `npm run logs` around the failure, with secrets redacted.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have redacted all API keys, path secrets, and public URLs from this report.
+          required: true
+        - label: I have searched existing issues and this is not a duplicate.
+          required: true

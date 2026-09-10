@@ -1,0 +1,15 @@
+# Normalise line endings in the repo, but check out native ones.
+* text=auto
+
+# Source and scripts are LF everywhere.
+*.ts   text eol=lf
+*.mjs  text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+
+# Windows batch files must be CRLF: cmd.exe mis-parses LF-only files.
+# They are also ASCII-only (see CONTRIBUTING) — cmd.exe mangles UTF-8 batch
+# files under `chcp 65001`, so any non-English text is emitted by the Node
+# scripts, never written into the .bat itself.
+*.bat  text eol=crlf

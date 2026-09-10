@@ -1,0 +1,45 @@
+name: Feature request
+description: Suggest an idea or improvement
+title: "feat: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This project deliberately stays small. Before proposing a feature, note
+        the scope constraints in CONTRIBUTING.md: the bridge exposes exactly one
+        tool, the tool description is treated as a load-bearing router, and the
+        security model is not negotiable in the loosening direction.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the problem, not the solution. Concrete use cases help enormously.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What you'd like to happen. If you considered alternatives, mention them.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have searched existing issues and this is not a duplicate.
+          required: true
+        - label: This request does not weaken the security model (capability URL, loopback binding, rate limiting, read-only tool).
+          required: true
