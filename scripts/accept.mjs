@@ -65,6 +65,7 @@ async function runTask(name, task, setup) {
     maxConcurrent: 1,
     hardWallMs: JOB_TIMEOUT_MS + 30_000,
     resultTtlMs: 60 * 60_000,
+    harnessName: "claude-code",
   });
 
   const job = registry.start({ task, mode: "code", workspace });

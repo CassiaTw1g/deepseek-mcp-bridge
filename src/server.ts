@@ -70,6 +70,7 @@ const registry = createRegistry(
     maxSteps: Number(process.env.BRIDGE_MAX_STEPS ?? 40),
     timeoutMs: Number(process.env.BRIDGE_JOB_TIMEOUT_MS ?? 15 * 60_000),
   }),
+  { harnessName: "claude-code" },
 );
 
 const app = express();

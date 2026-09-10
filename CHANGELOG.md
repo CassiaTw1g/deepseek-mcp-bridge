@@ -25,6 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Cancellation reported as failure.** A job stopped with `job kill` settled as `error`, telling the caller the sub-agent had crashed when a person had in fact stopped it.
 - **45-second process leak per call.** `Promise.race` does not cancel its loser, so the synchronous-window timer kept the event loop alive long after every `agent_start` had returned.
+- **Every job record named a harness that had never run.** The `harness` field was the literal `"pending"`, which no code ever overwrote — so a record written after a successful run still claimed no harness had been picked. Whoever chooses the runner now supplies `harnessName`; the default is `"unknown"` rather than a state that reads as "still deciding".
 
 ## [1.0.0] - 2026-09-11
 

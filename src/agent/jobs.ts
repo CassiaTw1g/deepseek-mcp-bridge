@@ -43,6 +43,7 @@ export interface Job {
   task: string;
   mode: DeepSeekMode;
   workspace: string;
+  /** Which runner executed it. Supplied by the caller via `harnessName`. */
   harness: string;
   startedAt: number;
   finishedAt?: number;
@@ -82,6 +83,15 @@ export interface RegistryOptions {
   /** How long a finished job stays retrievable before it is swept. */
   resultTtlMs?: number;
   stateDir?: string;
+  /**
+   * Written into every job record. The registry cannot work this out for
+   * itself — all it sees is a `JobRunner` function — so whoever picked the
+   * runner has to say which one they picked. This used to be the literal
+   * `"pending"`, which nothing ever overwrote: every record named a harness
+   * that had not been chosen, which is a lie in the one structure that exists
+   * to be a record.
+   */
+  harnessName?: string;
 }
 
 export interface Registry {
@@ -132,6 +142,7 @@ export function createRegistry(run: JobRunner, opts: RegistryOptions = {}): Regi
   const maxSteps = opts.maxSteps ?? 24;
   const hardWallMs = opts.hardWallMs ?? 20 * 60_000;
   const resultTtlMs = opts.resultTtlMs ?? 10 * 60_000;
+  const harnessName = opts.harnessName ?? "unknown";
 
   const stateDir = opts.stateDir ?? STATE_DIR;
   const jobsDir = join(stateDir, "jobs");
@@ -205,7 +216,7 @@ export function createRegistry(run: JobRunner, opts: RegistryOptions = {}): Regi
         task: input.task,
         mode: input.mode,
         workspace: input.workspace,
-        harness: "pending",
+        harness: harnessName,
         startedAt: Date.now(),
         steps: 0,
         events: [],
