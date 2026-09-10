@@ -86,9 +86,13 @@ check("start 描述写明了必须轮询", startDesc.includes("deepseek_agent_po
 check("start 描述警告不得编造结果", /不要向用户报告任何结论/.test(startDesc));
 check("start 要求 workspace 参数", "workspace" in (agentStart?.inputSchema?.properties ?? {}));
 
+// 用一个在两个平台上都真的在范围外的路径。这里不能写 `C:\Windows`:
+// 在 Linux 上那只是个带反斜杠的**相对名**,会被拼到允许根目录里面去,
+// 于是它反而合法 —— 断言就变成了在检验一个错误的前提(CI 上就是这么挂的)。
+const outside = resolve(ROOT, "..");
 const denied = await client.callTool({
   name: "deepseek_agent_start",
-  arguments: { task: "这一条不该被执行", workspace: "C:\\Windows" },
+  arguments: { task: "这一条不该被执行", workspace: outside },
 });
 const deniedText = denied?.content?.[0]?.text ?? "";
 check("工作区越界时 start 返回错误", Boolean(denied?.isError), deniedText.replace(/\n/g, " ").slice(0, 120));
