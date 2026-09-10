@@ -77,7 +77,10 @@ test("前缀检查必须带分隔符 —— D:\\wsother 不能靠 D:\\ws 蒙混�
   assert.equal(codeOf(join(WS, "..", "wsother", "x.txt")), "OUTSIDE");
 });
 
-test("大小写不敏感 —— D:\\WS 就是 D:\\ws", () => {
+// Win32 路径大小写不敏感,admit() 也只在 win32 上做小写化。在大小写敏感的
+// 文件系统上 `WS.toUpperCase()` 是另一个真实存在的目录,这里会失败——失败的是
+// 断言,不是被检查的代码。所以这条和 junction 一样,只在 Windows 上跑。
+test("大小写不敏感 —— D:\\WS 就是 D:\\ws", { skip: winOnly }, () => {
   reset();
   const upper = WS.toUpperCase();
   assert.equal(codeOf(upper), "OK");
