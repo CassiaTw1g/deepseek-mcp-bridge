@@ -1,6 +1,6 @@
 # deepseek-mcp-bridge
 
-把 **DeepSeek** 包装成一个 MCP 工具,供 ChatGPT connector(以及任何 MCP 客户端)调用。
+把 **DeepSeek** 包装成一个 MCP 工具,供 ChatGPT connector(以及任何 MCP 客户端)调用;也可以让它成为**能动手的子代理**——读文件、跑命令、多步迭代直到把任务做完。
 
 [English](README.md) · [更新日志](CHANGELOG.md) · [贡献指南](CONTRIBUTING.md) · [安全策略](SECURITY.md)
 
@@ -16,31 +16,43 @@ ChatGPT 的子代理槽位只接受 OpenAI 自家的模型档位(Sol / Terra / L
 |---|---|---|
 | 独立上下文 | 是 | 是(它只看到你传进去的 prompt) |
 | 独立性来源 | 独立会话,但同属 OpenAI 栈 | **不同厂商、不同模型,真正独立** |
-| 并行 | 是 | 否,同步请求/响应 |
+| 并行 | 是 | 是,通过 agent 任务——`agent_start` 返回 job id,`agent_poll` 取结果 |
 | 结果去向 | 留存于独立会话 | 回到调用方上下文 |
+| 能否碰你的机器 | 由宿主沙箱约束 | **能——只要你给了工作区。** 请先读[安全模型](#安全模型) |
 | 成本 | 订阅 credits | 走 DeepSeek API,独立计费(极便宜) |
 
 主要收益是**跨厂商独立复核**。如果你的提示词要求审查者**不得复用**实现者的结论,那么来自不同厂商的模型比同一技术栈的另一档位更符合这条要求——不存在共享的训练血脉去附和。
 
-> 本桥接是一个独立的 Node 进程,**不运行在** Claude Code、ChatGPT 或任何宿主里——它只与 `api.deepseek.com` 通信。
+> 桥接本身是一个独立的 Node 进程,只与 `api.deepseek.com` 通信,**不运行在** ChatGPT 或任何宿主里;**agent 任务是唯一的例外**——为了跑一个任务,它会以子进程方式启动 [Claude Code](https://claude.com/claude-code),把它的端点指向 DeepSeek 的 Anthropic 兼容接口。桥接从不运行在宿主**内部**,它负责**启动**宿主。
 
 ## 架构
 
 ```
-ChatGPT (Sol)  ──HTTPS──▶  Cloudflare 边缘  ──隧道──▶  本桥接 (localhost:8787)  ──▶  api.deepseek.com
-     │                                                                                     │
-     └── 工具调用: deepseek_flash(task, mode, files) ── 文本结果回到 Sol 上下文 ◀────────────┘
+ChatGPT (Sol) ──HTTPS──▶ Cloudflare 边缘 ──隧道──▶ 本桥接 (127.0.0.1:8787)
+                                                          │
+   deepseek_flash(task, mode, files) ─────────────────────┤──▶ api.deepseek.com ──▶ 文本回来
+                                                          │
+   deepseek_agent_start(task, workspace) ──▶ 任务注册表 ───┤   abort · TTL · nonce · 步数/时长上限
+   deepseek_agent_poll(job_id) ◀─────────────  快照        │
+                                                          │
+                                          harness: claude -p ──▶ api.deepseek.com/anthropic
+                                               │  Read / Write / Edit / Bash
+                                               │
+                                               └─ 审批提示(harness 的 stdio MCP 子进程,
+                                                  网络上够不着)──▶ 你,通过 `npm run ctl`
 ```
 
-- **传输**:MCP Streamable HTTP,无状态(`sessionIdGenerator: undefined`,每个请求新建 server + transport,调用方之间不串数据)。
+- **传输**:MCP Streamable HTTP,无状态(`sessionIdGenerator: undefined`,每个请求新建 server + transport,调用方之间不串数据)。但**任务注册表刻意不是每请求一个**——它整个进程只建一次,否则 `start` 一返回,任务就被忘光了。
 - **响应以 SSE 流式返回**,而不是缓冲成 JSON。这能让字节持续在链路上流动,避免 Cloudflare 免费版对长 DeepSeek 调用报 **524** 超时。
 - **鉴权**:能力 URL。MCP 端点是 `/mcp/<64 位 hex 密钥>`,**路径本身就是凭证**。裸 `/mcp` 和任何错误路径都返回 **404**,与"这里什么都没有"不可区分——因为 ChatGPT 的 connector 表单**没有填 Bearer token 的字段**。
+- **agent 任务必须异步**。ChatGPT 单次工具调用的预算约 60 秒,而一个真任务不止。`agent_start` 为快任务阻塞最多 45 秒,否则返回 job id 让你轮询。
 
 ## 环境要求
 
 - Node.js **>= 24**(使用原生 TypeScript 类型剥离,无需构建步骤)
 - 一个 DeepSeek API key——在 <https://platform.deepseek.com> 申请
 - [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)(快速隧道用;也可自行部署,见下文)
+- **仅 agent 任务需要:**`PATH` 上有 [Claude Code](https://claude.com/claude-code)(或设 `BRIDGE_CLAUDE_BIN`)。一次一答的 `deepseek_flash` 不需要额外依赖,离线测试套件也不需要它和 API key。
 
 ## 快速开始
 
@@ -91,17 +103,42 @@ npm run tunnel    # cloudflared 快速隧道;打印公网 URL 和完整的 MCP �
 
 ## 工具参考
 
-只暴露**一个**工具。工具越少,路由错误越少。
+两个分组、三个工具。三个都始终注册——但在设置 `DEEPSEEK_ALLOWED_ROOTS` 之前,两个 agent 工具会拒绝一切工作区并返回说明性错误,桥接保持只读。
 
-### `deepseek_flash`
+### `deepseek_flash` —— 一问一答
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `task` | string | 是 | 具体任务。写清目标、约束、期望的输出格式。独立复核场景下**不要在此透露你自己的结论**——那会污染独立性。 |
 | `mode` | enum | 否 | `analyze` \| `review` \| `code` \| `summarize`,选择系统提示词。默认 `analyze`。 |
-| `files` | string | 否 | 要分析/审查的代码或文本,纯文本透传。本桥接**无法访问你的文件系统**——内容必须贴在这里。 |
+| `files` | string | 否 | 要分析/审查的代码或文本,纯文本透传。**这个工具无法访问你的文件系统**——内容必须贴在这里。 |
 
 每个 `mode` 有独立的系统提示词。`review` 明确要求模型把材料中作者的结论视为**未经证实的声明**,并显式列出不同意之处——这正是把它路由到外部厂商的意义所在。
+
+### `deepseek_agent_start` —— 派一个需要动手的任务
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `task` | string | 是 | 具体任务。写清目标、约束、期望产出。不要透露你自己的结论。 |
+| `workspace` | string | 是 | 允许子代理操作的绝对路径——它以此为根读写文件、执行命令。必须落在 `DEEPSEEK_ALLOWED_ROOTS` 之内,否则调用被拒。 |
+| `mode` | enum | 否 | 为兼容保留;当前 harness 不读取该参数。 |
+
+最多阻塞 **45 秒**(ChatGPT 单次工具调用上限约 60 秒)。快任务直接内联返回结果,慢的返回一个 `job_id`。
+
+**调用方挂断不会取消任务。** AbortController 归任务注册表所有,不归 HTTP 请求所有——否则每个等得不耐烦的调用方都会**悄悄杀掉自己刚派出去的任务**。真要停用 `npm run ctl -- job kill <id>`。
+
+### `deepseek_agent_poll` —— 取结果
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `job_id` | string | 是 | `deepseek_agent_start` 返回的 id。 |
+| `wait_seconds` | number | 否 | 阻塞等待秒数,默认 20,上限 40。任务提前结束会立刻返回。 |
+
+每个终态结果都带一个建任务时生成的 **nonce**。调用方报结果却报不出这个码,就等于它没有结果——这就是它存在的意义。
+
+### 任务背后跑的是什么
+
+一个任务会启动 Claude Code(`claude -p … --output-format stream-json`),把 `ANTHROPIC_BASE_URL` 指向 `api.deepseek.com/anthropic`。于是**驱动循环的模型是 DeepSeek**,而循环本身、上下文压缩、提示词缓存、工具实现都是 Claude Code 自带的。每个工具事件都被记进任务轨迹,用 `npm run ctl -- jobs <id> --trace` 查看。
 
 ## 配置
 
@@ -118,6 +155,23 @@ npm run tunnel    # cloudflared 快速隧道;打印公网 URL 和完整的 MCP �
 | `DEEPSEEK_MODEL` | `deepseek-flash` | 模型 ID。 |
 | `DEEPSEEK_TIMEOUT_MS` | `90000` | 服务端超时;返回结构化错误而不是挂住。保持在 Cloudflare 100 秒边缘超时以下。 |
 | `DEEPSEEK_MAX_OUTPUT_TOKENS` | `4096` | 输出上限。`deepseek-flash` 是推理模型:`reasoning_content` 与 `content` **共享**这个预算,过度推理会挤掉正文。 |
+
+### agent 任务
+
+**不设 `DEEPSEEK_ALLOWED_ROOTS` 时,agent 工具拒绝一切工作区,桥接保持只读。** 下面这些只在设了它之后才有意义——请先读[安全模型](#安全模型)。
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `DEEPSEEK_ALLOWED_ROOTS` | *(空)* | 允许子代理操作的根目录,用 `;` 分隔。**空 = 拒绝一切**,不是"任意路径"。设了它就等于把机器交出去。 |
+| `BRIDGE_MAX_STEPS` | `40` | 每个任务的步数上限。 |
+| `BRIDGE_JOB_TIMEOUT_MS` | `900000` | 墙钟上限(15 分钟)。超时会连同整个子进程树一起结束。 |
+| `BRIDGE_APPROVAL_TIMEOUT_MS` | `300000` | 一条命令等人工处理多久(5 分钟)。**超时即拒绝。** |
+| `BRIDGE_APPROVE_ALLOW` | `node,npm,npx,git,tsc,dir,ls,cat,type,find,grep,echo` | 逗号分隔的预放行**命令名**。名单外的一律暂停等人工。 |
+| `BRIDGE_CC_APPROVAL` | 开 | 设为 `off` 会整个跳过审批队列——之后所有命令无人值守直接执行。只给 `npm run accept` 用。 |
+| `BRIDGE_CLAUDE_BIN` | `PATH` 上的 `claude` | Claude Code 可执行文件路径。 |
+| `BRIDGE_ANTHROPIC_BASE_URL` | `$DEEPSEEK_BASE_URL/anthropic` | harness 把请求发到哪里。 |
+| `BRIDGE_STATE_DIR` | `<项目目录>/.state` | 任务快照、审批队列、审计日志的位置。 |
+| `BRIDGE_CC_MAX_BUDGET_USD` | *(未设)* | 可选的 harness `--max-budget-usd`。默认关掉**是因为 Claude Code 按 Claude 的价格计费**——这里设的限额读数约等于真实 DeepSeek 花费的 100 倍,会把任务提前掐断。 |
 
 ## 生命周期命令
 
@@ -136,15 +190,37 @@ npm run uninstall  # 停止并清除本地状态(保留项目目录)
 
 `npm run start --foreground` 前台运行,便于调试。
 
-## 验证
+### agent 任务与审批命令
 
-三层,从最便宜的开始。
-
-**1. 内存传输自检——不需要网络和 key:**
+这些命令读的是服务写下的文件,所以在**另一个终端**里跑就行——而且即使服务在"请求发出"和"你答复"之间重启过,它们照样有效。
 
 ```bash
-npm test              # typecheck + 内存内 MCP 往返
+npm run ctl -- jobs                # 所有任务:状态 / 步数 / 耗时 / 验证码
+npm run ctl -- jobs <id> --trace   # 完整轨迹:第几步调了什么工具
+npm run ctl -- job kill <id>       # 取消一个运行中的任务(连同子进程树)
+npm run ctl -- pending             # 正在等你批准的命令,附完整原文
+npm run ctl -- approve <id>        # 放行
+npm run ctl -- deny <id>           # 拒绝——模型会收到原因,并被明确告知不要绕路
+npm run ctl -- audit               # 最近的审批记录(--all 看全部)
 ```
+
+## 验证
+
+四层,从最便宜的开始。
+
+**1. 离线段——不需要网络、不需要 key、不花钱:**
+
+```bash
+npm test
+```
+
+| 套件 | 守住什么 |
+|---|---|
+| `test:loop` | 响应解析与请求计数。一个工具回合**不得**被发两次;`reasoning_content` 必须活着回到下一个请求,否则 API 直接 400。 |
+| `test:sandbox` | 路径逃逸回归:UNC、`\\?\`、NTFS 备用数据流、保留设备名、尾随点、前缀边界、junction。Windows 专有项在别的平台自动跳过;硬链接缺口被断言为**成功**,而不是假装它不存在。 |
+| `test:approvals` | 审批协议:自动放行规则、串联命令的拒绝,以及**所有非人工出口——超时、被取消、决定文件损坏——一律归为拒绝**。 |
+| `test:jobs` | 任务注册表。最要紧的一条:**客户端断线不得杀掉任务**——因为 MCP SDK 会在客户端挂断时 abort 当前请求处理器。 |
+| `selftest:memory` | 内存内 MCP 往返;agent 工具已注册,且越界工作区会被拒。 |
 
 **2. 公网端点冒烟测试——走真实 HTTP 链路:**
 
@@ -155,14 +231,31 @@ npm run smoke -- https://host/mcp/xxx  # 或显式传入端点
 
 它断言:健康检查正常、裸 `/mcp` 返回 404、错误密钥返回 404、真实 `tools/call` 返回非空内容。它用 Node 的 `fetch`,**不是 `curl`**——原因见下面的 Windows 说明。
 
-**3. ChatGPT 到底有没有调用?**
+**3. 验收——子代理到底有没有干活的能力?**(在线,花一点点钱)
+
+```bash
+npm run accept           # 三个任务全跑
+npm run accept -- --only B
+```
+
+三个**只会聊天的模型不可能通过**的任务:
+
+| | 任务 | 通过意味着 |
+|---|---|---|
+| **A** | 把只存在于文件里的 32 位随机串反转后复现出来 | 它真的读了文件——除此之外没有任何办法得到那个串 |
+| **B** | 运行一个脚本、看到报错、修好它、再运行一次 | **轨迹里出现 ≥2 次命令执行。** 一次性作答的模型不可能预先知道程序会失败;这是"它真的在循环"的铁证 |
+| **C** | 报告一个并不存在的文件的内容 | 它如实说找不到。**会编造的子代理比不会干活的更危险** |
+
+B 是承重的那一根。该套件刻意关掉了审批,所以它不进 `npm test`。
+
+**4. ChatGPT 到底有没有调用?**
 
 服务端访问日志和聊天记录长得一模一样——无论模型是真的调了工具,还是只是**叙述**它调了。唯一可信的信号是:
 
 - `npm run logs` 里的 `tools/call deepseek_flash` 日志行,以及
 - DeepSeek 控制台用量页面对应的记录。
 
-如果聊天里出现了像模像样的回答,但**两者都**安静,那说明调用模型在角色扮演。回去打磨工具 description 或你的派发规则。
+对 agent 任务,`npm run ctl -- jobs` 还必须显示一条**步数 > 1**、且带着真实工作区路径的记录。如果聊天里出现了像模像样的回答,但这些信号**全部**安静,那说明调用模型在角色扮演。回去打磨工具 description 或你的派发规则。
 
 ## 部署方式
 
@@ -188,17 +281,47 @@ npm run smoke -- https://host/mcp/xxx  # 或显式传入端点
 | Cloudflare 524 | 单次调用超过约 100 秒边缘超时。慢响应已走 SSE 流式;降低 `DEEPSEEK_TIMEOUT_MS` 或拆分任务。 |
 | 本机访问不了隧道 URL | 本地路由器 DNS 可能还没解析到新的 `trycloudflare.com` 子域。用 `curl --resolve` 对 `1.1.1.1` 验证;这只影响本地检查,不影响 ChatGPT。 |
 | **Windows / git-bash**:结果乱码或 token 暴涨 | git-bash 里的 `curl` 会把非 ASCII 请求体重编码成 GBK,导致模型对乱码进行推理。改用 `npm run smoke`(Node `fetch`),不要用 `curl`。 |
+| `agent_start` 报"工作区被拒绝" | 路径不在 `DEEPSEEK_ALLOWED_ROOTS` 里,或者该变量没设——空 = 拒绝一切,不是任意路径。 |
+| agent 任务一直卡在 `waiting_approval` | 有命令在等你。跑 `npm run ctl -- pending`,然后 `approve <id>` 或 `deny <id>`。5 分钟无人处理即自动拒绝。 |
+| 每个 agent 任务都立刻失败 | `PATH` 上没有 Claude Code。装上它,或用 `BRIDGE_CLAUDE_BIN` 指向可执行文件。 |
+| agent 任务跑到一半被杀 | 撞上了步数上限(`BRIDGE_MAX_STEPS`,默认 40)或墙钟上限(`BRIDGE_JOB_TIMEOUT_MS`,默认 15 分钟)。`npm run ctl -- jobs <id> --trace` 能看到最后走到哪一步。 |
+| 你 kill 掉的任务显示成 `error` 而不是 `cancelled` | 那是 bug——人主动停下不等于崩溃。请上报。 |
 
 ## 安全模型
 
-暴露到公网前请务必阅读。
+暴露到公网前请务必阅读。它有**两层**,各自防的是完全不同的东西。
+
+### 第一层 —— 保住你的账单
+
+始终生效。
 
 - **路径密钥就是凭证。** 拿到 URL 的任何人都能花你的 DeepSeek 额度。当作密码对待;用 `npm run ctl -- secret` 轮换。
 - **绑定回环地址。** `HOST` 默认 `127.0.0.1`。不要设成 `0.0.0.0`。
 - **限流**默认开启,URL 泄漏时限制滥用。
 - **DeepSeek 消费上限**是最后一道防线——去控制台设上。
 - **使用独立的 API key。** 不要复用其他工具依赖的 key;桥接 key 泄漏时应能独立撤销而不产生连带损失。
-- 本工具是**只读**的:只返回文本,无文件系统访问。
+
+### 第二层 —— 保住你的电脑
+
+> **第一层一条都挡不住这件事。** 一旦设了 `DEEPSEEK_ALLOWED_ROOTS`,拿到那个 URL 的人就能让子代理在你的机器上读写文件、执行命令。"能执行命令"就等于**拿到你这台电脑**。
+
+开箱状态下桥接仍然是只读的——agent 工具拒绝一切工作区,只能花额度。两档之间是数量级的差距:
+
+| 你放出去的能力 | 拿到 URL 的人能做到什么 |
+|---|---|
+| 什么都不开(默认) | 花掉你的 DeepSeek 额度。**碰不到你的电脑。** |
+| 设了 `DEEPSEEK_ALLOWED_ROOTS` | 读、改那些根目录下的文件 |
+| ……再加上执行命令 | **跑任意命令 —— 那就是这台机器** |
+
+护栏如下,以及同样重要的——[它们**不是**什么](SECURITY.md#honest-limits--these-are-not-guarantees):
+
+- **失败即拒绝。** 没设 `DEEPSEEK_ALLOWED_ROOTS` 就是拒绝一切工作区,永远不会"默认任意路径"。
+- **每个工作区都必须过 `src/sandbox.ts`**——它是唯一把调用方给的字符串变成真实路径的地方。
+- **名单外的命令会暂停任务等人处理。** 无人应答即拒绝,没有"默认放行"这条路;审批通道是 harness 的 stdio 子进程,不是能力 URL 上的端点——否则调用方就能自己批准自己的命令。
+- **步数、时长、进程树三重上限**,外加 `.state/audit.log` 审计日志。
+- **清空 `DEEPSEEK_ALLOWED_ROOTS` 并重启即可退回第一层。** 这是受支持的配置,也是推荐的起步方式:先只读跑一段时间,确认 URL 没泄漏,再考虑打开。
+
+**这不是安全边界,是人的观察窗口。** 真正的边界只有沙盒或虚拟机——任务跑起来时人要在电脑旁。**不要把开了 agent 能力的实例部署成公网服务。**
 
 上报漏洞请见 [SECURITY.md](SECURITY.md)。
 

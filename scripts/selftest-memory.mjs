@@ -13,6 +13,8 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpServer } from "../src/mcp.ts";
+import { createRegistry } from "../src/agent/jobs.ts";
+import { createPolicy } from "../src/sandbox.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -34,7 +36,15 @@ function check(name, ok, detail = "") {
 
 const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 
-const server = createMcpServer();
+// A stub runner: nothing here should ever reach the point of spawning a real
+// job, because every agent assertion below is about the paths that get
+// *rejected* before a job exists.
+const registry = createRegistry(async () => ({ text: "stub", steps: 0 }), {
+  stateDir: join(ROOT, ".state", "selftest"),
+});
+const policy = createPolicy([ROOT]);
+
+const server = createMcpServer(registry, policy);
 const client = new Client({ name: "selftest-memory", version: "1.0.0" });
 
 await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
@@ -61,6 +71,28 @@ if (called?.isError) {
 } else {
   check("DeepSeek 返回了内容", text.length > 0, text.slice(0, 200));
 }
+
+// --- agent 工具:注册与拒绝路径 -------------------------------------------
+// 这里只验证「被拒绝」的一侧。放行的那一侧会真的启动子进程、真的花钱,
+// 属于 npm run accept 的职责,不属于一个毫秒级的自检。
+
+const agentStart = tools.find((t) => t.name === "deepseek_agent_start");
+const agentPoll = tools.find((t) => t.name === "deepseek_agent_poll");
+const startDesc = agentStart?.description ?? "";
+
+check("工具 deepseek_agent_start 已注册", Boolean(agentStart));
+check("工具 deepseek_agent_poll 已注册", Boolean(agentPoll));
+check("start 描述写明了必须轮询", startDesc.includes("deepseek_agent_poll"));
+check("start 描述警告不得编造结果", /不要向用户报告任何结论/.test(startDesc));
+check("start 要求 workspace 参数", "workspace" in (agentStart?.inputSchema?.properties ?? {}));
+
+const denied = await client.callTool({
+  name: "deepseek_agent_start",
+  arguments: { task: "这一条不该被执行", workspace: "C:\\Windows" },
+});
+const deniedText = denied?.content?.[0]?.text ?? "";
+check("工作区越界时 start 返回错误", Boolean(denied?.isError), deniedText.replace(/\n/g, " ").slice(0, 120));
+check("拒绝信息给出了原因", /工作区被拒绝|OUTSIDE/.test(deniedText));
 
 await client.close();
 await server.close();

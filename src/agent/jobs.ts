@@ -1,0 +1,317 @@
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { DeepSeekMode, Usage } from "../deepseek.ts";
+
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+
+/**
+ * Job state lives on disk, not just in memory, for two reasons:
+ *
+ *  1. `npm run ctl` is a *separate process* from the server. A file is the
+ *     cheapest channel that works across that boundary without adding an
+ *     endpoint — and adding a control endpoint would widen the attack surface
+ *     of a process whose whole security model is "one secret URL".
+ *  2. When the server restarts, a job that was running leaves a record behind,
+ *     so a lost result is recoverable rather than simply gone.
+ */
+export const STATE_DIR = process.env.BRIDGE_STATE_DIR ?? join(ROOT, ".state");
+const JOBS_DIR = join(STATE_DIR, "jobs");
+const CANCEL_DIR = join(STATE_DIR, "cancel");
+
+export type JobState = "running" | "waiting_approval" | "done" | "error" | "cancelled";
+
+export interface JobEvent {
+  at: number;
+  step: number;
+  type: "model" | "tool" | "note" | "error";
+  name?: string;
+  detail?: string;
+}
+
+export interface JobResult {
+  text: string;
+  steps: number;
+  usage?: Usage;
+}
+
+export interface Job {
+  id: string;
+  /** Revealed only in the terminal result — see `nonce` in `start()`. */
+  nonce: string;
+  state: JobState;
+  task: string;
+  mode: DeepSeekMode;
+  workspace: string;
+  harness: string;
+  startedAt: number;
+  finishedAt?: number;
+  steps: number;
+  result?: JobResult;
+  error?: string;
+  events: JobEvent[];
+  /** Resolves on the first terminal state. Never rejects. */
+  settled: Promise<void>;
+}
+
+export interface JobInput {
+  task: string;
+  mode: DeepSeekMode;
+  workspace: string;
+}
+
+export interface JobContext {
+  jobId: string;
+  /** Job-scoped. Owned by the registry — NEVER wired to a request's signal. */
+  signal: AbortSignal;
+  /** How the harness reports progress; feeds `ctl jobs --trace`. */
+  record: (event: Omit<JobEvent, "at">) => void;
+  setSteps: (n: number) => void;
+  setWaitingApproval: (waiting: boolean) => void;
+  /** Cross-process kill switch: `.state/cancel/<job_id>`. */
+  checkCancelled: () => boolean;
+}
+
+export type JobRunner = (input: JobInput, ctx: JobContext) => Promise<JobResult>;
+
+export interface RegistryOptions {
+  /** A job is up to N model calls; keep this well under the tool rate limit. */
+  maxConcurrent?: number;
+  maxSteps?: number;
+  hardWallMs?: number;
+  /** How long a finished job stays retrievable before it is swept. */
+  resultTtlMs?: number;
+  stateDir?: string;
+}
+
+export interface Registry {
+  start(input: JobInput): Job;
+  get(id: string): Job | undefined;
+  list(): Job[];
+  cancel(id: string): boolean;
+  shutdown(): void;
+}
+
+const MAX_EVENTS = 400;
+
+/**
+ * Short, pronounceable, unambiguous — no O/0 or I/1, so a model reciting it
+ * back has to have actually received it. This nonce is the only defence against
+ * a caller confabulating a result it never got: the value is returned *only* in
+ * the terminal payload, so "I have the answer" is checkable rather than
+ * rhetorical.
+ */
+function makeNonce(): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const pick = () => alphabet[Math.floor(Math.random() * alphabet.length)];
+  const block = () => pick() + pick() + pick() + pick();
+  return `${block()}-${pick()}${pick()}${pick()}`;
+}
+
+function makeJobId(): string {
+  const t = Date.now().toString(36);
+  const r = Math.random().toString(36).slice(2, 8);
+  return `${t}-${r}`;
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+interface JobRecord extends Job {
+  controller: AbortController;
+  settle: () => void;
+}
+
+export function createRegistry(run: JobRunner, opts: RegistryOptions = {}): Registry {
+  const maxConcurrent = opts.maxConcurrent ?? 2;
+  const maxSteps = opts.maxSteps ?? 24;
+  const hardWallMs = opts.hardWallMs ?? 20 * 60_000;
+  const resultTtlMs = opts.resultTtlMs ?? 10 * 60_000;
+
+  const stateDir = opts.stateDir ?? STATE_DIR;
+  const jobsDir = join(stateDir, "jobs");
+  const cancelDir = join(stateDir, "cancel");
+  mkdirSync(jobsDir, { recursive: true });
+  mkdirSync(cancelDir, { recursive: true });
+
+  const jobs = new Map<string, JobRecord>();
+
+  function snapshot(rec: JobRecord): void {
+    const { controller: _c, settle: _s, settled: _p, ...plain } = rec;
+    try {
+      writeFileSync(join(jobsDir, `${rec.id}.json`), JSON.stringify(plain, null, 2), "utf8");
+    } catch {
+      // Disk is a nicety here, not a correctness requirement. A job must not
+      // die because the state directory went away.
+    }
+  }
+
+  function isCancelled(id: string): boolean {
+    return existsSync(join(cancelDir, `${id}.json`));
+  }
+
+  function settleWith(rec: JobRecord, state: JobState, patch: Partial<JobRecord> = {}): void {
+    if (rec.state === "done" || rec.state === "error" || rec.state === "cancelled") return;
+    rec.state = state;
+    rec.finishedAt = Date.now();
+    Object.assign(rec, patch);
+    snapshot(rec);
+    rec.settle();
+  }
+
+  function activeCount(): number {
+    let n = 0;
+    for (const rec of jobs.values()) if (rec.state === "running" || rec.state === "waiting_approval") n++;
+    return n;
+  }
+
+  function sweep(): void {
+    const now = Date.now();
+    for (const [id, rec] of jobs) {
+      const finished = rec.state === "done" || rec.state === "error" || rec.state === "cancelled";
+      if (finished && now - (rec.finishedAt ?? 0) > resultTtlMs) {
+        jobs.delete(id);
+        try {
+          rmSync(join(jobsDir, `${id}.json`), { force: true });
+        } catch {
+          /* best effort */
+        }
+      }
+    }
+  }
+
+  const sweeper = setInterval(sweep, 60_000);
+  sweeper.unref();
+
+  return {
+    start(input: JobInput): Job {
+      if (activeCount() >= maxConcurrent) {
+        throw new Error(
+          `同时运行的任务已达上限(${maxConcurrent})。等当前任务结束,或用 \`npm run ctl -- jobs\` 查看在用任务。`,
+        );
+      }
+
+      const { promise: settled, resolve: settle } = deferred();
+
+      const rec: JobRecord = {
+        id: makeJobId(),
+        nonce: makeNonce(),
+        state: "running",
+        task: input.task,
+        mode: input.mode,
+        workspace: input.workspace,
+        harness: "pending",
+        startedAt: Date.now(),
+        steps: 0,
+        events: [],
+        settled,
+        controller: new AbortController(),
+        settle,
+      };
+      jobs.set(rec.id, rec);
+      snapshot(rec);
+
+      // The hard wall clock is the backstop for a job whose runner ignores its
+      // signal, or a model that keeps finding one more thing to try.
+      const wallTimer = setTimeout(() => {
+        rec.controller.abort();
+        settleWith(rec, "error", { error: `任务超过 ${Math.round(hardWallMs / 60_000)} 分钟硬上限,已中止。` });
+      }, hardWallMs);
+      wallTimer.unref();
+
+      const ctx: JobContext = {
+        jobId: rec.id,
+        signal: rec.controller.signal,
+        record(event) {
+          rec.events.push({ at: Date.now(), ...event });
+          if (rec.events.length > MAX_EVENTS) rec.events.splice(0, rec.events.length - MAX_EVENTS);
+        },
+        setSteps(n) {
+          rec.steps = n;
+        },
+        setWaitingApproval(waiting) {
+          if (rec.state === "done" || rec.state === "error" || rec.state === "cancelled") return;
+          rec.state = waiting ? "waiting_approval" : "running";
+          snapshot(rec);
+        },
+        checkCancelled: () => isCancelled(rec.id) || rec.controller.signal.aborted,
+      };
+
+      void run(input, ctx)
+        .then((result) => {
+          clearTimeout(wallTimer);
+          if (rec.controller.signal.aborted || isCancelled(rec.id)) {
+            settleWith(rec, "cancelled", { error: "任务被取消。" });
+            return;
+          }
+          settleWith(rec, "done", { result });
+        })
+        .catch((err: unknown) => {
+          clearTimeout(wallTimer);
+          const message = err instanceof Error ? err.message : String(err);
+          // Both ways of cancelling have to be checked here. `ctl job kill`
+          // arrives as a *file*, not as an abort, so a killed job used to settle
+          // as `error` — and the caller was then told the sub-agent had failed
+          // when in fact a person had stopped it. Those are different events and
+          // the payload says different things about each.
+          const cancelled = rec.controller.signal.aborted || isCancelled(rec.id);
+          settleWith(rec, cancelled ? "cancelled" : "error", { error: message });
+        });
+
+      return rec;
+    },
+
+    get(id: string): Job | undefined {
+      return jobs.get(id);
+    },
+
+    list(): Job[] {
+      return [...jobs.values()].sort((a, b) => b.startedAt - a.startedAt);
+    },
+
+    cancel(id: string): boolean {
+      const rec = jobs.get(id);
+      // Write the sentinel even for a job we do not know about: the running
+      // server may hold a job this process never started.
+      try {
+        mkdirSync(cancelDir, { recursive: true });
+        writeFileSync(join(cancelDir, `${id}.json`), JSON.stringify({ at: Date.now() }), "utf8");
+      } catch {
+        /* best effort */
+      }
+      if (!rec) return false;
+      rec.controller.abort();
+      settleWith(rec, "cancelled", { error: "任务被取消。" });
+      return true;
+    },
+
+    shutdown(): void {
+      clearInterval(sweeper);
+      for (const rec of jobs.values()) {
+        if (rec.state === "running" || rec.state === "waiting_approval") rec.controller.abort();
+      }
+    },
+  };
+}
+
+/** Read job snapshots left on disk by the server (used by `ctl jobs`). */
+export function readJobSnapshots(stateDir = STATE_DIR): Job[] {
+  const dir = join(stateDir, "jobs");
+  if (!existsSync(dir)) return [];
+  const out: Job[] = [];
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(join(dir, name), "utf8")) as Job;
+      out.push(parsed);
+    } catch {
+      /* skip corrupt snapshot */
+    }
+  }
+  return out.sort((a, b) => b.startedAt - a.startedAt);
+}

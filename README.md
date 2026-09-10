@@ -1,6 +1,6 @@
 # deepseek-mcp-bridge
 
-An MCP server that exposes **DeepSeek** as a tool for ChatGPT connectors (and any other MCP client).
+An MCP server that exposes **DeepSeek** as a tool for ChatGPT connectors (and any other MCP client) — and, optionally, as a sub-agent that reads files, runs commands, and works a multi-step task to completion on your machine.
 
 [中文说明](README.zh-CN.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
@@ -16,31 +16,43 @@ That has real consequences you should understand before deploying:
 |---|---|---|
 | Separate context | Yes | Yes (it only sees the prompt you send) |
 | Independence | Separate session, same OpenAI stack | **Different vendor, different model — genuinely independent** |
-| Parallelism | Yes | No — synchronous request/response |
+| Parallelism | Yes | Yes, via agent jobs — `agent_start` hands back a job id, `agent_poll` collects it |
 | Result destination | Retained in its own session | Returns into the caller's context |
+| Can touch your machine | Sandboxed by the host | **Yes — once you grant a workspace.** Read [Security model](#security-model) first |
 | Cost | Subscription credits | DeepSeek API, billed separately (very cheap) |
 
 The main practical payoff is **cross-vendor independent review**. If your prompt requires that a reviewer must *not* reuse the implementer's conclusions, a model from a different vendor satisfies that requirement far better than another tier of the same stack — there is no shared training lineage to echo.
 
-> The bridge is a standalone Node process. It does **not** run inside Claude Code, ChatGPT, or any host — it talks only to `api.deepseek.com`.
+> The bridge itself is a standalone Node process that talks only to `api.deepseek.com`. **Agent jobs are the exception**: to run one it spawns [Claude Code](https://claude.com/claude-code) as a child process, pointed at DeepSeek's Anthropic-compatible endpoint. The bridge never runs *inside* a host — it launches one.
 
 ## Architecture
 
 ```
-ChatGPT (Sol)  ──HTTPS──▶  Cloudflare edge  ──tunnel──▶  this bridge (localhost:8787)  ──▶  api.deepseek.com
-     │                                                                                            │
-     └── tool call: deepseek_flash(task, mode, files) ── text result returns to Sol's context ◀────┘
+ChatGPT (Sol) ──HTTPS──▶ Cloudflare edge ──tunnel──▶ bridge (127.0.0.1:8787)
+                                                            │
+   deepseek_flash(task, mode, files) ───────────────────────┤──▶ api.deepseek.com ──▶ text back
+                                                            │
+   deepseek_agent_start(task, workspace) ──▶ job registry ──┤   abort · TTL · nonce · step/time ceilings
+   deepseek_agent_poll(job_id) ◀────────────  snapshots     │
+                                                            │
+                                            harness: claude -p ──▶ api.deepseek.com/anthropic
+                                                 │  Read / Write / Edit / Bash
+                                                 │
+                                                 └─ approval prompt (stdio MCP child of the harness,
+                                                    never reachable over the URL) ──▶ you, via `npm run ctl`
 ```
 
-- **Transport**: MCP Streamable HTTP, stateless (`sessionIdGenerator: undefined`, a fresh server + transport per request so callers never share state).
+- **Transport**: MCP Streamable HTTP, stateless (`sessionIdGenerator: undefined`, a fresh server + transport per request so callers never share state). The **job registry is deliberately not per-request** — it is created once per process, or every job would be forgotten the moment its `start` call returned.
 - **Responses stream as SSE** rather than buffered JSON. This keeps bytes moving on the wire, which avoids Cloudflare's free-tier **524** timeout on long DeepSeek calls.
 - **Auth**: a **capability URL**. The MCP endpoint is `/mcp/<64-hex-secret>`; the path *is* the credential. The bare `/mcp` path and any wrong path return **404**, indistinguishable from nothing being there — because ChatGPT's connector form has no Bearer-token field.
+- **Agent jobs are asynchronous by necessity.** ChatGPT's tool-call budget is around 60 s; a real task is not. `agent_start` blocks up to 45 s for a fast job and otherwise returns a job id to poll.
 
 ## Requirements
 
 - Node.js **>= 24** (uses native TypeScript type-stripping; no build step)
 - A DeepSeek API key — create one at <https://platform.deepseek.com>
 - [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) for the quick tunnel (or bring your own deployment — see below)
+- **For agent jobs only:** [Claude Code](https://claude.com/claude-code) on `PATH` (or set `BRIDGE_CLAUDE_BIN`). The one-shot `deepseek_flash` tool has no extra dependencies, and the offline test suite does not need either this or an API key.
 
 ## Quick start
 
@@ -91,17 +103,42 @@ The tool description is the router. It states *dispatch conditions*, not just wh
 
 ## Tool reference
 
-One tool is exposed. Fewer tools means fewer routing mistakes.
+Three tools in two groups. All three are always registered — but until `DEEPSEEK_ALLOWED_ROOTS` is set, the two agent tools reject every workspace with an explanatory error, so the bridge stays read-only.
 
-### `deepseek_flash`
+### `deepseek_flash` — one question, one answer
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `task` | string | yes | The concrete task. State the goal, constraints, and expected output format. For independent review, **do not reveal your own conclusion here** — it contaminates the independence. |
 | `mode` | enum | no | `analyze` \| `review` \| `code` \| `summarize`. Selects the system prompt. Default `analyze`. |
-| `files` | string | no | The code/text to analyse, passed through as plain text. The bridge **cannot access your filesystem** — content must be inlined here. |
+| `files` | string | no | The code/text to analyse, passed through as plain text. This tool **cannot access your filesystem** — content must be inlined here. |
 
 Each `mode` gets a distinct system prompt. `review` explicitly instructs the model to treat any author conclusion in the material as an unverified claim and to state disagreements explicitly — that is the point of routing to an external vendor.
+
+### `deepseek_agent_start` — hand over a task that needs hands
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `task` | string | yes | The concrete task. State the goal, constraints, and expected output. Do not reveal your own conclusion. |
+| `workspace` | string | yes | Absolute path the sub-agent may work in — it reads, writes and runs commands with this as its root. Must fall inside `DEEPSEEK_ALLOWED_ROOTS`, or the call is rejected. |
+| `mode` | enum | no | Accepted for compatibility; the current harness does not read it. |
+
+Blocks up to **45 s** (ChatGPT caps a tool call near 60 s). A fast job returns its result inline; anything longer returns a `job_id`.
+
+**The client hanging up does not cancel the job.** The abort controller belongs to the job registry, not to the HTTP request — otherwise every caller that lost patience would silently kill the work it had just dispatched. Use `npm run ctl -- job kill <id>` to actually stop one.
+
+### `deepseek_agent_poll` — collect it
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `job_id` | string | yes | The id `deepseek_agent_start` returned. |
+| `wait_seconds` | number | no | Blocking wait, default 20, max 40. Returns early if the job finishes sooner. |
+
+Every terminal payload carries a **nonce** minted at job creation. An agent that reports an outcome without quoting it does not have a result — that is the point.
+
+### Behind the job: what the sub-agent actually runs
+
+A job spawns Claude Code (`claude -p … --output-format stream-json`) with `ANTHROPIC_BASE_URL` pointed at `api.deepseek.com/anthropic`, so the model driving the loop is DeepSeek while the loop, context compaction, prompt caching and tool implementations are Claude Code's own. Every tool event is captured into the job trace, readable with `npm run ctl -- jobs <id> --trace`.
 
 ## Configuration
 
@@ -118,6 +155,23 @@ All via `.env` (gitignored):
 | `DEEPSEEK_MODEL` | `deepseek-flash` | Model ID. |
 | `DEEPSEEK_TIMEOUT_MS` | `90000` | Server-side timeout; returns a structured error instead of hanging. Kept under Cloudflare's 100 s edge timeout. |
 | `DEEPSEEK_MAX_OUTPUT_TOKENS` | `4096` | Output cap. `deepseek-flash` is a reasoning model: `reasoning_content` and `content` **share** this budget, so a task that over-reasons can starve the answer. |
+
+### Agent jobs
+
+**With `DEEPSEEK_ALLOWED_ROOTS` unset, the agent tools reject every workspace and the bridge stays read-only.** These settings only matter once you set it — read [Security model](#security-model) first.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DEEPSEEK_ALLOWED_ROOTS` | *(empty)* | `;`-separated roots a sub-agent may work in. **Empty means deny everything**, not "anywhere". Setting this is the switch that hands over the machine. |
+| `BRIDGE_MAX_STEPS` | `40` | Step ceiling per job. |
+| `BRIDGE_JOB_TIMEOUT_MS` | `900000` | Wall-clock ceiling (15 min). On expiry the job and its entire process tree are killed. |
+| `BRIDGE_APPROVAL_TIMEOUT_MS` | `300000` | How long a command waits for a human (5 min). **Expiry is a deny.** |
+| `BRIDGE_APPROVE_ALLOW` | `node,npm,npx,git,tsc,dir,ls,cat,type,find,grep,echo` | Comma-separated pre-approved command *names*. Anything else pauses the job for a human. |
+| `BRIDGE_CC_APPROVAL` | on | Set to `off` to skip the approval queue entirely — every command then runs unattended. Only for `npm run accept`. |
+| `BRIDGE_CLAUDE_BIN` | `claude` on `PATH` | Path to the Claude Code binary. |
+| `BRIDGE_ANTHROPIC_BASE_URL` | `$DEEPSEEK_BASE_URL/anthropic` | Where the harness sends its requests. |
+| `BRIDGE_STATE_DIR` | `<repo>/.state` | Job snapshots, approval queue, audit log. |
+| `BRIDGE_CC_MAX_BUDGET_USD` | *(unset)* | Opt-in `--max-budget-usd` for the harness. Left off by default **because Claude Code prices at Claude rates** — a limit set here reads as roughly 100× the real DeepSeek cost and would cut jobs off early. |
 
 ## Lifecycle commands
 
@@ -136,15 +190,37 @@ npm run uninstall  # stop and clear local state (leaves the project directory)
 
 `npm run start --foreground` runs in the foreground for debugging.
 
-## Verification
+### Agent job and approval commands
 
-Three layers, cheapest first.
-
-**1. Memory transport self-test — no network, no key needed:**
+These read the files the server writes, so they work from a second terminal — and they still work if the server was restarted between the request and your answer.
 
 ```bash
-npm test              # typecheck + in-memory MCP round trip
+npm run ctl -- jobs                # every job: state, steps, duration, nonce
+npm run ctl -- jobs <id> --trace   # full trace: which tool at which step
+npm run ctl -- job kill <id>       # cancel a running job, process tree included
+npm run ctl -- pending             # commands waiting for your approval, in full
+npm run ctl -- approve <id>        # let it run
+npm run ctl -- deny <id>           # refuse it — the model is told why, and told not to route around it
+npm run ctl -- audit               # recent approval decisions (--all for everything)
 ```
+
+## Verification
+
+Four layers, cheapest first.
+
+**1. Offline suites — no network, no key, no money:**
+
+```bash
+npm test
+```
+
+| Suite | What it guards |
+|---|---|
+| `test:loop` | Response parsing and request accounting. A tool-call turn must not be sent twice; `reasoning_content` must survive back into the next request or the API returns 400. |
+| `test:sandbox` | Path-escape regressions: UNC, `\\?\`, alternate data streams, reserved device names, trailing dots, prefix boundaries, junctions. Windows-only cases self-skip elsewhere, and the hardlink gap is asserted as *success* rather than pretended away. |
+| `test:approvals` | The approval protocol: auto-approval rules, chaining refusal, and that every non-human exit — timeout, cancellation, a corrupt decision file — resolves to **deny**. |
+| `test:jobs` | The registry. Chiefly: **a client disconnect must not kill the job**, because the MCP SDK aborts per-request handlers when a client hangs up. |
+| `selftest:memory` | In-memory MCP round trip; the agent tools are registered and reject an out-of-scope workspace. |
 
 **2. Public endpoint smoke test — exercises the real HTTP path:**
 
@@ -155,14 +231,31 @@ npm run smoke -- https://host/mcp/xxx  # or pass an endpoint explicitly
 
 This asserts the health check, that a bare `/mcp` returns 404, that a wrong secret returns 404, and that a real `tools/call` returns non-empty content. It uses Node's `fetch`, **not** `curl` — see the Windows note below.
 
-**3. Did ChatGPT actually call us?**
+**3. Acceptance — is the sub-agent actually capable?** (online, costs a little)
+
+```bash
+npm run accept           # all three tasks
+npm run accept -- --only B
+```
+
+Three tasks a chat-only model cannot pass:
+
+| | Task | Passing means |
+|---|---|---|
+| **A** | Reproduce a 32-character random string that exists only inside a file, reversed | It really read the file — nothing else can produce that string |
+| **B** | Run a script, observe the failure, fix it, run it again | **Two or more command executions in the trace.** A model answering in one shot cannot know the program fails; this is the hard evidence that it loops |
+| **C** | Report the contents of a file that does not exist | It says so. A sub-agent that fabricates is more dangerous than one that cannot work |
+
+Test B is the load-bearing one. Approval is deliberately disabled for the suite, which is why it is not part of `npm test`.
+
+**4. Did ChatGPT actually call us?**
 
 Server access logs and the chat transcript look identical whether the model truly called the tool or merely *narrated* doing so. The only trustworthy signals are:
 
 - the log line `tools/call deepseek_flash` in `npm run logs`, and
 - a matching entry in the DeepSeek console usage page.
 
-If the chat shows a plausible answer but **both** are silent, the calling model role-played the call. Re-sharpen the tool description or your dispatch rule.
+For agent jobs, `npm run ctl -- jobs` must also show a record with **more than one step** and a real workspace path. If the chat shows a plausible answer but every one of those is silent, the calling model role-played the call. Re-sharpen the tool description or your dispatch rule.
 
 ## Deployment options
 
@@ -188,17 +281,47 @@ Avoid the ngrok free tier: its interstitial warning page requires an `ngrok-skip
 | Cloudflare 524 | A single call exceeded the ~100 s edge timeout. Slow responses already stream as SSE; lower `DEEPSEEK_TIMEOUT_MS` or split the work. |
 | Tunnel URL unreachable from your own machine | Local router DNS may not have the fresh `trycloudflare.com` subdomain yet. Confirm with `curl --resolve` against `1.1.1.1`; this affects only local checks, not ChatGPT. |
 | **Windows / git-bash**: garbled results or token blowups | `curl` in git-bash re-encodes non-ASCII request bodies as GBK, so the model reasons over mojibake. Use `npm run smoke` (Node `fetch`) instead of `curl`. |
+| `agent_start` returns "工作区被拒绝" | The path is outside `DEEPSEEK_ALLOWED_ROOTS`, or that variable is unset — empty means deny everything, not anywhere. |
+| Agent job sits in `waiting_approval` forever | A command is waiting for you. Run `npm run ctl -- pending`, then `approve <id>` or `deny <id>`. Unanswered for 5 min is an automatic deny. |
+| Every agent job fails immediately | Claude Code is not on `PATH`. Install it, or point `BRIDGE_CLAUDE_BIN` at the binary. |
+| Agent job dies partway through | Step ceiling (`BRIDGE_MAX_STEPS`, default 40) or wall clock (`BRIDGE_JOB_TIMEOUT_MS`, default 15 min). `npm run ctl -- jobs <id> --trace` shows the last step reached. |
+| A job you killed shows as `error`, not `cancelled` | That is a bug — a person stopping a job is not a crash. Please report it. |
 
 ## Security model
 
-Read this before exposing anything.
+Read this before exposing anything. It has two tiers, and they defend completely different things.
+
+### Tier 1 — protecting your bill
+
+Applies always.
 
 - **The path secret is the credential.** Anyone with the URL can spend your DeepSeek quota. Treat it like a password; rotate with `npm run ctl -- secret`.
 - **Bind to loopback.** `HOST` defaults to `127.0.0.1`. Do not set `0.0.0.0`.
 - **Rate limiting** is on by default and caps abuse if the URL leaks.
 - **A DeepSeek spend cap** in the provider console is the final backstop — set it.
 - **Use a separate API key.** Do not reuse a key that other tools depend on; a leaked bridge key should be revocable without collateral damage.
-- The tool is **read-only**: it returns text and has no filesystem access.
+
+### Tier 2 — protecting your computer
+
+> **None of tier 1 stops this.** Set `DEEPSEEK_ALLOWED_ROOTS` and whoever holds that URL can make the sub-agent read and write files on your machine, and run commands on it. "Can run commands" means "has your computer."
+
+Out of the box the bridge is still read-only — the agent tools refuse every workspace and can only spend quota. The tiers are orders of magnitude apart:
+
+| What you enable | What the holder of the URL can do |
+|---|---|
+| Nothing (default) | Spend your DeepSeek quota. **Cannot touch your computer.** |
+| `DEEPSEEK_ALLOWED_ROOTS` set | Read and modify files under those roots |
+| …plus command execution | **Run arbitrary commands — that is the machine** |
+
+The guardrails, and — just as importantly — [what they are *not*](SECURITY.md#honest-limits--these-are-not-guarantees):
+
+- **Fail closed.** No `DEEPSEEK_ALLOWED_ROOTS` means every workspace is denied, never "anywhere by default".
+- **Every workspace goes through `src/sandbox.ts`**, which is the only place a caller-supplied string becomes a real path.
+- **Commands outside the allow-list pause the job for a human.** Unanswered means deny; there is no default-allow path, and the approval channel is a stdio child of the harness rather than an endpoint on the URL — otherwise a caller could approve its own commands.
+- **Step, time and process-tree ceilings**, plus an audit log at `.state/audit.log`.
+- **Clear `DEEPSEEK_ALLOWED_ROOTS` and restart to go back to tier 1.** That is a supported configuration and the recommended place to start: run read-only for a while, confirm the URL has not leaked, and only then consider turning it on.
+
+**This is not a security boundary. It is an observation window.** The only real boundary is a sandbox or a VM — be at the machine while jobs run. Do not ship a public deployment of this with agent capabilities enabled.
 
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 

@@ -2,6 +2,9 @@ import "dotenv/config";
 import express from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpServer } from "./mcp.ts";
+import { createRegistry } from "./agent/jobs.ts";
+import { createClaudeCodeRunner } from "./harness/claude-code.ts";
+import { createPolicy, parseRoots } from "./sandbox.ts";
 
 const PORT = Number(process.env.PORT ?? 8787);
 // Loopback only. The tunnel runs on this machine, so nothing outside it has any
@@ -37,6 +40,38 @@ function isRateLimited(key: string): boolean {
   return recent.length > RATE_LIMIT_MAX;
 }
 
+// ---------------------------------------------------------------------------
+// Agent jobs
+// ---------------------------------------------------------------------------
+
+// Fail closed: with no roots configured, every workspace is denied. An agent
+// tool that silently defaults to "anywhere on disk" is worse than one that
+// refuses to run until someone names the directories they meant.
+const allowedRoots = parseRoots(process.env.DEEPSEEK_ALLOWED_ROOTS);
+const policy = createPolicy(allowedRoots);
+
+if (allowedRoots.length === 0) {
+  console.warn(
+    "DEEPSEEK_ALLOWED_ROOTS 未设置 —— agent 工具会拒绝所有工作区。\n" +
+      "要启用,请在 .env 里列出允许子代理操作的根目录(多个用 ; 分隔)并重启。",
+  );
+} else {
+  console.log(`允许的工作区根目录:${allowedRoots.join(", ")}`);
+}
+
+/**
+ * One registry for the whole process — deliberately created out here, not
+ * inside the request handler. `createMcpServer()` runs once per request in
+ * stateless mode, so a registry built there would forget every job the instant
+ * its `start` call returned.
+ */
+const registry = createRegistry(
+  createClaudeCodeRunner({
+    maxSteps: Number(process.env.BRIDGE_MAX_STEPS ?? 40),
+    timeoutMs: Number(process.env.BRIDGE_JOB_TIMEOUT_MS ?? 15 * 60_000),
+  }),
+);
+
 const app = express();
 app.set("trust proxy", true);
 app.use(express.json({ limit: "2mb" }));
@@ -63,10 +98,16 @@ app.post(MCP_PATH, async (req, res) => {
   console.log(`[${new Date().toISOString()}] ${method}${toolName ? ` ${toolName}` : ""}`);
 
   // Stateless: a fresh server+transport per request. Sharing them across
-  // requests leaks state between callers.
-  const server = createMcpServer();
+  // requests leaks state between callers. The registry is passed in precisely
+  // because it must NOT be per-request.
+  const server = createMcpServer(registry, policy);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
 
+  // Closing the transport aborts the SDK's per-request handler signal, which
+  // the client triggers simply by hanging up — routine when a 45-second
+  // synchronous window exceeds ChatGPT's own tool timeout. That signal is used
+  // only to stop waiting; it is never wired to a job's controller, or every
+  // impatient caller would kill its own job.
   res.on("close", () => {
     void transport.close();
     void server.close();
@@ -113,6 +154,9 @@ const httpServer = app.listen(PORT, HOST, () => {
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     console.log(`Received ${signal}, shutting down.`);
+    // Abort in-flight jobs first: each one owns a spawned Claude Code process
+    // and possibly a tree of grandchildren under it.
+    registry.shutdown();
     httpServer.close(() => process.exit(0));
   });
 }
