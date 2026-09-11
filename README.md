@@ -8,22 +8,30 @@ An MCP server that exposes **DeepSeek** as a tool for ChatGPT connectors (and an
 
 ## What this is actually for
 
-**It turns ChatGPT from something that tells you how to do a thing into something that does the thing on your machine.**
+**It puts another working sub-agent inside your ChatGPT conversation — one whose brain can be any model you like.**
 
-A native ChatGPT sub-agent cannot do that. It runs in the vendor's sandbox and cannot see your filesystem, and every tool call it makes is bounded by a budget of roughly 60 seconds — a long task gets cut off part-way. This bridge takes down both walls.
+Be precise about this, because the project gets retold wrong a lot: **ChatGPT's own sub-agents (Luna and friends) can already do real work** — they read and write files on your machine, run commands, and iterate. This bridge is not filling in a missing capability.
+
+The real constraint sits elsewhere: **sub-agent slots only accept OpenAI's own model tiers** (Sol / Terra / Luna). An external model cannot be registered as one. So the moment you want a *different* model doing that work — faster, cheaper, or independent enough to review the implementer — the only door in is an **MCP connector**.
+
+And an MCP tool is a text interface by default: you call it, you get text back. To let an external model actually *work*, you have to hand it a whole environment first.
 
 **The mechanism matters more than the outcome: it does not plug DeepSeek in, it gives DeepSeek hands.** A bridge that only forwards an API hands the host one more model to ask. This one does not — on an agent job it spawns **a full agent harness** ([Claude Code](https://claude.com/claude-code)) as a child process, pointed at DeepSeek's Anthropic-compatible endpoint. So the loop, context compaction, prompt caching and tool implementations — everything that makes a model *able to work* — are an existing, maintained implementation rather than a hand-rolled imitation. What the host gets is therefore a **sub-agent that can do the job**, not a Q&A endpoint.
 
 And it is exposed as **one MCP tool**, so any MCP-capable host can call it; the ChatGPT connector is one door in, and so far the only one tested. The harness layer is a swappable part — Claude Code is its current implementation, not the essence of the design.
 
-| Native sub-agent | This bridge |
+| Native sub-agent (Luna et al.) | This bridge |
 |---|---|
-| Gives advice; you do the work | **Reads, writes and edits files on your machine** |
-| Runs in the vendor's sandbox | **Runs commands in your directories, iterating until the task is done** |
-| ~60 s per tool call | **Asynchronous jobs that can run for many minutes** |
-| You cannot see what it is about to do | **Every command off the allow-list pauses for your approval** |
+| Can do the whole job | Can do the whole job too — **with a different executor** |
+| Model is an OpenAI tier, and the slot is not swappable | Model is **DeepSeek V4.1 Flash** (552B MoE, ~1M context); two lines of `.env` swap it |
+| Harness is built into the platform, invisible and fixed | Harness is **Claude Code**, a swappable part |
+| Same stack as Sol, shared training preferences | **External model, no shared lineage** — which is what makes it useful for security review and counter-examples |
+
+> **About "faster" — an honest note.** From my own use the felt difference is two things: **fewer steps for the same task, and a higher chance of getting it right the first time.** But I **have not benchmarked it** — I have not run the same task set against Luna and DeepSeek as a controlled comparison. So that is a subjective impression, not performance data. It may also not hold for every task: there is community feedback that non-OpenAI models do worse on `apply_patch`-style mechanical edits. **Try it on a small slice first; do not switch wholesale.**
 
 **Measured, not intended**: given "read `witness.txt`, reverse its contents, write them to `answer.txt`", the sub-agent ran 3 steps over 2 min 25 s; the `answer.txt` on disk matched the expected string **byte for byte**, next to a nonce that only a real result can produce. A chat transcript agreeing with itself is not evidence — **bytes on disk are**.
+
+*That measurement shows it really does the work. It does **not** show it is faster than Luna — the efficiency difference is still an impression, not a comparison.*
 
 > ⚠️ **This capability is off by default.** With no `DEEPSEEK_ALLOWED_ROOTS` set, the bridge can only spend your DeepSeek quota and cannot touch your computer. Turn it on and anyone holding the URL can read and write files and run commands on your machine — **"can run commands" means "has your computer."** Read the [security model](#security-model) first.
 
@@ -41,12 +49,12 @@ That has real consequences you should understand before deploying:
 | Independence | Separate session, same OpenAI stack | **Different vendor, different model — genuinely independent** |
 | Parallelism | Yes | Yes, via agent jobs — `agent_start` hands back a job id, `agent_poll` collects it |
 | Result destination | Retained in its own session | Returns into the caller's context |
-| Can touch your machine | Sandboxed by the host | **Yes — once you grant a workspace.** Read [Security model](#security-model) first |
+| Can touch your machine | Yes — but only inside the host's own sandbox, never your filesystem | **Yes — in *your* directories, once you grant a workspace.** Read [Security model](#security-model) first |
 | Cost | Subscription credits | DeepSeek API, billed separately (very cheap) |
 
 The main practical payoff is **cross-vendor independent review**. If your prompt requires that a reviewer must *not* reuse the implementer's conclusions, a model from a different vendor satisfies that requirement far better than another tier of the same stack — there is no shared training lineage to echo.
 
-**Swapping the host model does not break this.** The bridge does not depend on Sol. Its value comes from two platform constraints — a hosted sub-agent has no filesystem access, and a tool call gets roughly 60 seconds — and neither is a property of the model tier. Move to another tier and both walls are still standing, so the bridge is still doing the same job. Only the sub-agent side is ever re-pointed: edit `DEEPSEEK_BASE_URL` and `DEEPSEEK_MODEL` in `.env` and run `npm run ctl -- reload` (the tunnel is left alone, so the URL does not change). The two things that *would* make this redundant are both platform-level, not model-level: giving sub-agents filesystem access, or raising the tool-call budget to minutes.
+**Swapping the host model does not break this.** The bridge does not depend on Sol, or on which tier you are running. It depends on one thing: **sub-agent slots are not open to external models.** That is a property of the platform, not of the model tier — change tiers and the slot is still closed, so this bridge is still the only way in. Only the sub-agent side is ever re-pointed: edit `DEEPSEEK_BASE_URL` and `DEEPSEEK_MODEL` in `.env` and run `npm run ctl -- reload` (the tunnel is left alone, so the URL does not change). The one change that *would* make this redundant is platform-level, not model-level: **OpenAI opening the sub-agent slot to external models.**
 
 > The bridge itself is a standalone Node process that talks only to `api.deepseek.com`. **Agent jobs are the exception**: to run one it spawns [Claude Code](https://claude.com/claude-code) as a child process, pointed at DeepSeek's Anthropic-compatible endpoint. The bridge never runs *inside* a host — it launches one.
 
