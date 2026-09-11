@@ -12,6 +12,10 @@ An MCP server that exposes **DeepSeek** as a tool for ChatGPT connectors (and an
 
 A native ChatGPT sub-agent cannot do that. It runs in the vendor's sandbox and cannot see your filesystem, and every tool call it makes is bounded by a budget of roughly 60 seconds — a long task gets cut off part-way. This bridge takes down both walls.
 
+**The mechanism matters more than the outcome: it does not plug DeepSeek in, it gives DeepSeek hands.** A bridge that only forwards an API hands the host one more model to ask. This one does not — on an agent job it spawns **a full agent harness** ([Claude Code](https://claude.com/claude-code)) as a child process, pointed at DeepSeek's Anthropic-compatible endpoint. So the loop, context compaction, prompt caching and tool implementations — everything that makes a model *able to work* — are an existing, maintained implementation rather than a hand-rolled imitation. What the host gets is therefore a **sub-agent that can do the job**, not a Q&A endpoint.
+
+And it is exposed as **one MCP tool**, so any MCP-capable host can call it; the ChatGPT connector is one door in, and so far the only one tested. The harness layer is a swappable part — Claude Code is its current implementation, not the essence of the design.
+
 | Native sub-agent | This bridge |
 |---|---|
 | Gives advice; you do the work | **Reads, writes and edits files on your machine** |
