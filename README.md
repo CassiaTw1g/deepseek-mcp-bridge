@@ -42,6 +42,8 @@ That has real consequences you should understand before deploying:
 
 The main practical payoff is **cross-vendor independent review**. If your prompt requires that a reviewer must *not* reuse the implementer's conclusions, a model from a different vendor satisfies that requirement far better than another tier of the same stack — there is no shared training lineage to echo.
 
+**Swapping the host model does not break this.** The bridge does not depend on Sol. Its value comes from two platform constraints — a hosted sub-agent has no filesystem access, and a tool call gets roughly 60 seconds — and neither is a property of the model tier. Move to another tier and both walls are still standing, so the bridge is still doing the same job. Only the sub-agent side is ever re-pointed: edit `DEEPSEEK_BASE_URL` and `DEEPSEEK_MODEL` in `.env` and run `npm run ctl -- reload` (the tunnel is left alone, so the URL does not change). The two things that *would* make this redundant are both platform-level, not model-level: giving sub-agents filesystem access, or raising the tool-call budget to minutes.
+
 > The bridge itself is a standalone Node process that talks only to `api.deepseek.com`. **Agent jobs are the exception**: to run one it spawns [Claude Code](https://claude.com/claude-code) as a child process, pointed at DeepSeek's Anthropic-compatible endpoint. The bridge never runs *inside* a host — it launches one.
 
 ## Architecture
