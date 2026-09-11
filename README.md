@@ -187,7 +187,7 @@ All via `.env` (gitignored):
 
 | Variable | Default | Notes |
 |---|---|---|
-| `DEEPSEEK_ALLOWED_ROOTS` | *(empty)* | `;`-separated roots a sub-agent may work in. **Empty means deny everything**, not "anywhere". Setting this is the switch that hands over the machine. |
+| `DEEPSEEK_ALLOWED_ROOTS` | *(empty)* | `;`-separated roots a sub-agent may work in. **Empty means deny everything**, not "anywhere". Setting this is the switch that hands over the machine. Manage it with `npm run ctl -- allow "D:\project"` — it writes `.env` and reloads, so the tunnel and the public URL are untouched. |
 | `BRIDGE_MAX_STEPS` | `40` | Step ceiling per job. |
 | `BRIDGE_JOB_TIMEOUT_MS` | `900000` | Wall-clock ceiling (15 min). On expiry the job and its entire process tree are killed. |
 | `BRIDGE_APPROVAL_TIMEOUT_MS` | `300000` | How long a command waits for a human (5 min). **Expiry is a deny.** |
@@ -226,6 +226,8 @@ Generates a new secret, restarts **the server only**, and prints the new public 
 Rotate whenever the URL may have been seen by anyone else. It is the only thing standing between your machine and whoever holds it.
 
 On Windows, `windows/7-轮换密钥.bat` does the same thing from a double-click. If you prefer to drive it yourself, `npm run ctl -- secret` writes the secret without restarting anything — you then have to restart and update the connector by hand.
+
+The same shape applies to the workspace allow-list: `windows/8-添加项目目录.bat` asks for a path and runs `npm run ctl -- allow "<dir>"`, which writes `.env` and reloads with the tunnel left alone. Quote the path or use forward slashes — a bare `D:\codex\3` typed into a POSIX shell loses its backslashes.
 
 ### The secret is no longer printed
 

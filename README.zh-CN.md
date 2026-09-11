@@ -187,7 +187,7 @@ npm run tunnel    # cloudflared 快速隧道;打印公网 URL 和完整的 MCP �
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `DEEPSEEK_ALLOWED_ROOTS` | *(空)* | 允许子代理操作的根目录,用 `;` 分隔。**空 = 拒绝一切**,不是"任意路径"。设了它就等于把机器交出去。 |
+| `DEEPSEEK_ALLOWED_ROOTS` | *(空)* | 允许子代理操作的根目录,用 `;` 分隔。**空 = 拒绝一切**,不是"任意路径"。设了它就等于把机器交出去。用 `npm run ctl -- allow "D:\项目"` 增删——它会写 `.env` 并 reload,隧道和公网 URL 都不动。 |
 | `BRIDGE_MAX_STEPS` | `40` | 每个任务的步数上限。 |
 | `BRIDGE_JOB_TIMEOUT_MS` | `900000` | 墙钟上限(15 分钟)。超时会连同整个子进程树一起结束。 |
 | `BRIDGE_APPROVAL_TIMEOUT_MS` | `300000` | 一条命令等人工处理多久(5 分钟)。**超时即拒绝。** |
@@ -226,6 +226,8 @@ npm run ctl -- rotate
 只要 URL 有可能被别人看到过就轮换一次。它是你的电脑和"拿到这个 URL 的人"之间唯一的东西。
 
 Windows 上双击 `windows/7-轮换密钥.bat` 效果相同。想自己控制的话,`npm run ctl -- secret` 只写密钥、不重启任何东西 —— 之后你得手动重启并更新 connector。
+
+工作区白名单是同一套做法:双击 `windows/8-添加项目目录.bat`,它问你要一个路径,然后运行 `npm run ctl -- allow "<目录>"` —— 写 `.env` 并 reload,隧道不动。路径记得加引号或用正斜杠:在 POSIX shell 里直接敲 `D:\codex\3`,反斜杠会被吃掉。
 
 ### 密钥默认不再打印
 

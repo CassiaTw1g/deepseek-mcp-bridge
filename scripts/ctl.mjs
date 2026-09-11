@@ -3,7 +3,7 @@
  * Lifecycle manager for the deepseek-bridge plugin.
  *
  * start / stop / restart / reload / status / enable / disable / logs / uninstall
- * secret / rotate / tunnel / untunnel / jobs / pending / approve / deny / audit
+ * secret / rotate / tunnel / untunnel / allow / jobs / pending / approve / deny / audit
  *
  * `reload` restarts the server alone; `restart` also restarts the tunnel, which
  * changes the public URL.
@@ -662,6 +662,109 @@ function cmdUninstall({ purge = false } = {}) {
   }
 }
 
+function readRoots() {
+  return (parseEnvFile().DEEPSEEK_ALLOWED_ROOTS || "")
+    .split(";")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function writeRoots(roots) {
+  const lines = existsSync(ENV_FILE) ? readFileSync(ENV_FILE, "utf8").split(/\r?\n/) : [];
+  const value = roots.join(";");
+  let hit = false;
+  const out = lines.map((line) => {
+    if (/^\s*DEEPSEEK_ALLOWED_ROOTS\s*=/.test(line)) {
+      hit = true;
+      return `DEEPSEEK_ALLOWED_ROOTS=${value}`;
+    }
+    return line;
+  });
+  if (!hit) {
+    while (out.length && out[out.length - 1] === "") out.pop();
+    out.push(`DEEPSEEK_ALLOWED_ROOTS=${value}`, "");
+  }
+  writeFileSync(ENV_FILE, out.join("\n"), "utf8");
+}
+
+/** 盘根、用户目录、`C:\Users` —— 这些不是"一个项目",是整台机器。 */
+function dangerousRoot(resolved) {
+  const norm = resolved.replace(/[\\/]+$/, "").toLowerCase();
+  if (/^[a-z]:$/.test(norm)) return "一个盘符根目录";
+  const home = (process.env.USERPROFILE || process.env.HOME || "").replace(/[\\/]+$/, "").toLowerCase();
+  if (home && norm === home) return "你的用户目录";
+  if (norm === "c:\\users" || norm === "/c/users") return "整个用户目录树";
+  return null;
+}
+
+/**
+ * 增删工作区白名单,不必手改 `.env`。
+ *
+ * 白名单是唯一一道"子代理能不能碰某个项目"的闸,同时也是"拿到 URL 的人能写这台机器上
+ * 多少东西"的闸。手改 `.env` 是上一轮任务悄悄降级的原因:子代理看得见那道门,却没有
+ * 任何办法通过它,于是调用方只好换成一个同厂商的复核者 —— 独立性就这么没了。
+ * 这条命令把开门变成一行,并且每开一次都再说一遍开的是什么。
+ */
+function cmdAllow(args) {
+  const target = args.positional[0];
+  const roots = readRoots();
+
+  if (!target) {
+    console.log("子代理当前可以在这些根目录下工作:");
+    if (!roots.length) console.log("  (空 —— 所有工作区都会被拒绝,只能花额度)");
+    for (const r of roots) console.log(`  ${r}`);
+    console.log("");
+    console.log('添加: npm run ctl -- allow "D:\\某个项目"');
+    console.log('移除: npm run ctl -- allow --remove "D:\\某个项目"');
+    console.log("");
+    console.log("路径用正斜杠也行(D:/某个项目)—— 在 Git Bash 里反斜杠会被 shell 吃掉。");
+    return;
+  }
+
+  const resolved = resolve(target);
+  const key = resolved.toLowerCase();
+  const present = roots.some((r) => resolve(r).toLowerCase() === key);
+
+  if (args.flags.has("--remove")) {
+    if (!present) {
+      console.error(`白名单里没有 ${resolved}`);
+      process.exit(1);
+    }
+    writeRoots(roots.filter((r) => resolve(r).toLowerCase() !== key));
+    console.log(`已移除:${resolved}`);
+    console.log("");
+    console.log("当前白名单:");
+    for (const r of readRoots()) console.log(`  ${r}`);
+    cmdReload();
+    return;
+  }
+
+  if (present) {
+    console.log(`${resolved} 已经在白名单里,没有改动。`);
+    return;
+  }
+  if (!existsSync(resolved)) {
+    console.error(`这个路径不存在:${resolved}`);
+    process.exit(1);
+  }
+  const danger = dangerousRoot(resolved);
+  if (danger && !args.flags.has("--force")) {
+    console.error(`拒绝:${resolved} 是${danger},等于把整台机器交出去。`);
+    console.error("确实要这样,加 --force。");
+    process.exit(1);
+  }
+
+  writeRoots([...roots, resolved]);
+  console.log(`已添加:${resolved}`);
+  console.log("");
+  console.log("当前白名单:");
+  for (const r of readRoots()) console.log(`  ${r}`);
+  console.log("");
+  console.log("⚠️  拿到公网 URL 的人,现在可以在上面这些目录里读写文件、执行命令。");
+  console.log("    「能执行命令」等于「拿到了这台电脑」。");
+  cmdReload();
+}
+
 const [command, ...rest] = process.argv.slice(2);
 const flags = new Set(rest);
 const positional = rest.filter((a) => !a.startsWith("-"));
@@ -707,6 +810,9 @@ switch (command) {
   case "uninstall":
     cmdUninstall({ purge: flags.has("--purge") });
     break;
+  case "allow":
+    cmdAllow({ positional, flags });
+    break;
   case "jobs":
     cmdJobs(positional[0], { trace: flags.has("--trace") });
     break;
@@ -747,6 +853,9 @@ switch (command) {
   disable      停用并停止服务
   secret       生成并写入 MCP_PATH_SECRET(会同步更新 .env)
   rotate       换一个 MCP_PATH_SECRET,只重启服务,并把新的完整 URL 放进剪贴板
+  allow        看子代理能在哪些根目录下工作
+  allow "D:\项目"            把一个项目加进白名单(写 .env 并 reload,URL 不变)
+  allow --remove "D:\项目"   从白名单移除
   uninstall    停止服务并清除本地状态(并提示如何移除 ChatGPT connector)
 
 端点里的密钥默认隐藏成 <密钥已隐藏> —— 每打印一份就多一处留存(终端历史、
