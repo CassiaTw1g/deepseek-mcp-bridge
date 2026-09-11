@@ -33,6 +33,12 @@ export interface JobResult {
   text: string;
   steps: number;
   usage?: Usage;
+  /**
+   * Set when the runner stopped before finishing, with the reason. The job
+   * still settles as `error` — a half-finished review is not a review — but the
+   * text is kept so the work is not simply thrown away.
+   */
+  incomplete?: string;
 }
 
 export interface Job {
@@ -49,6 +55,8 @@ export interface Job {
   finishedAt?: number;
   steps: number;
   result?: JobResult;
+  /** Salvage from a run that was stopped early. Never a substitute for `result`. */
+  partial?: JobResult;
   error?: string;
   events: JobEvent[];
   /** Resolves on the first terminal state. Never rejects. */
@@ -78,7 +86,6 @@ export type JobRunner = (input: JobInput, ctx: JobContext) => Promise<JobResult>
 export interface RegistryOptions {
   /** A job is up to N model calls; keep this well under the tool rate limit. */
   maxConcurrent?: number;
-  maxSteps?: number;
   hardWallMs?: number;
   /** How long a finished job stays retrievable before it is swept. */
   resultTtlMs?: number;
@@ -139,7 +146,10 @@ interface JobRecord extends Job {
 
 export function createRegistry(run: JobRunner, opts: RegistryOptions = {}): Registry {
   const maxConcurrent = opts.maxConcurrent ?? 2;
-  const maxSteps = opts.maxSteps ?? 24;
+  // No step limit here on purpose: this layer cannot count steps — only the
+  // runner sees the model's tool calls. It used to read a `maxSteps` option and
+  // never use it, which read as "the registry enforces 24 steps" while the real
+  // ceiling lived somewhere else entirely.
   const hardWallMs = opts.hardWallMs ?? 20 * 60_000;
   const resultTtlMs = opts.resultTtlMs ?? 10 * 60_000;
   const harnessName = opts.harnessName ?? "unknown";
@@ -256,8 +266,16 @@ export function createRegistry(run: JobRunner, opts: RegistryOptions = {}): Regi
       void run(input, ctx)
         .then((result) => {
           clearTimeout(wallTimer);
+          const salvage = result.incomplete ? result : undefined;
           if (rec.controller.signal.aborted || isCancelled(rec.id)) {
-            settleWith(rec, "cancelled", { error: "任务被取消。" });
+            settleWith(rec, "cancelled", { error: "任务被取消。", partial: salvage });
+            return;
+          }
+          // Stopped early by the runner: filed as an error, never as a success.
+          // `partial` carries what it did manage, so the caller can narrow the
+          // task instead of starting over from nothing.
+          if (result.incomplete) {
+            settleWith(rec, "error", { error: result.incomplete, partial: result });
             return;
           }
           settleWith(rec, "done", { result });

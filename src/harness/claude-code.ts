@@ -60,8 +60,18 @@ const EXTRA_SYSTEM_PROMPT = [
   "在本机做计算或文本处理时,优先「写一个脚本文件,再用 node 运行」,不要写多语句的 PowerShell 一行流:",
   "  1. 用 Write 工具在当前工作目录里写一个小脚本(例如 reverse.mjs)",
   "  2. 运行:node reverse.mjs",
-  "原因:含 ; 或 | 的 PowerShell 命令会被暂停、等人工批准,会拖慢任务;而 node <脚本名> 是直接放行的。",
-  "读取单个文件、列目录这类简单操作,直接用 Get-Content / Get-ChildItem 等只读命令即可。",
+  "原因:含 ; 或 | 的 PowerShell / Bash 命令会被暂停、等人工批准,会拖慢任务;而 node <脚本名> 是直接放行的。",
+  "读取单个文件、列目录这类简单操作,直接用 Get-Content / Get-ChildItem / ls 等**单个**只读命令即可。",
+  "**这条对 Bash 和 PowerShell 一样成立,别以为换个工具就绕过去了**:",
+  "  - 不要写 `find ... | head -100`、`ls -la; pwd`、`a && b`、`x > out.txt` 这类串联 —— 它们一律转人工,",
+  "    任务会停在「等待批准」,直到有人到电脑上点确认,超时就直接拒绝。",
+  "  - 要截断或过滤输出,就在 node 脚本里做(`.slice()`、`.filter()`),不要把管道写进命令行。",
+  "",
+  "任务有工具调用次数上限,超了会被强制中止。请省着用:",
+  "  - 先用 Glob / Grep 定位,再 Read;读大文件用 offset/limit 只取需要的段落,不要整篇读。",
+  "  - 要看好几个文件时,在同一轮里并行发起多个 Read,不要一个文件一轮。",
+  "审查、分析、调研这类任务:**边看边把已经确认的结论追加写进工作区里的报告文件**(例如 报告.md),不要等全部看完再一次性写。",
+  "  这样即使任务中途被上限中止,已经查实的内容也留在磁盘上,不会白跑。",
 ].join("\n");
 
 export interface ClaudeCodeOptions {
@@ -211,8 +221,8 @@ export async function runClaudeCode(
   }
 
   const bin = resolveBin(options.bin);
-  const maxSteps = options.maxSteps ?? 40;
-  const timeoutMs = options.timeoutMs ?? 15 * 60_000;
+  const maxSteps = options.maxSteps ?? 120;
+  const timeoutMs = options.timeoutMs ?? 30 * 60_000;
 
   const stateDir = options.stateDir ?? STATE_DIR;
   const approvalOn = options.approval ?? process.env.BRIDGE_CC_APPROVAL !== "off";
@@ -284,6 +294,37 @@ export async function runClaudeCode(
   let stderr = "";
   let killedFor: string | undefined;
 
+  // Kept so an aborted run still yields something. A stop used to discard
+  // everything the sub-agent had read and reasoned about: a review that hit the
+  // ceiling at step 41 came back as a bare one-line error, leaving the caller
+  // with nothing to narrow down or resume from — and no way to tell "it did
+  // nothing" apart from "it did most of it and ran out of room".
+  const notes: string[] = [];
+  const toolTrace: string[] = [];
+
+  /**
+   * What to hand back when the run is stopped mid-flight. Deliberately loud that
+   * this is NOT a result: the whole risk of salvaging partial work is that a
+   * caller reads a half-finished survey as a finished one.
+   */
+  const partialReport = (reason: string): string => {
+    const counts = new Map<string, number>();
+    for (const name of toolTrace) counts.set(name, (counts.get(name) ?? 0) + 1);
+    const summary = [...counts].map(([name, n]) => `${name}×${n}`).join("  ");
+    const tail = notes.join("\n---\n").slice(-3000);
+    return [
+      `任务在完成前被中止:${reason}`,
+      "",
+      "下面只是它中止前已经做到的部分,**不是结论、也没有核查完整**,不能当作任务结果使用。",
+      "",
+      "【它最后说过的内容(可能半途而止)】",
+      tail || "(它还没来得及输出任何文字)",
+      "",
+      "【已执行的工具调用】",
+      summary || "(无)",
+    ].join("\n");
+  };
+
   const stop = (reason: string) => {
     if (killedFor) return;
     killedFor = reason;
@@ -346,6 +387,7 @@ export async function runClaudeCode(
           const b = block as { type?: string; name?: string; input?: unknown; text?: string };
           if (b?.type === "tool_use") {
             toolCalls++;
+            toolTrace.push(String(b.name ?? "?"));
             ctx.setSteps(toolCalls);
             ctx.record({
               step: toolCalls,
@@ -355,6 +397,10 @@ export async function runClaudeCode(
             });
             if (toolCalls > maxSteps) stop(`任务超过 ${maxSteps} 步上限,已中止。`);
           } else if (b?.type === "text" && typeof b.text === "string" && b.text.trim()) {
+            notes.push(b.text.trim());
+            // Only the tail can be salvaged anyway; without a cap a chatty run
+            // holds every paragraph it ever wrote.
+            if (notes.length > 40) notes.shift();
             ctx.record({ step: toolCalls, type: "note", detail: b.text.slice(0, 300) });
           }
         }
@@ -387,12 +433,18 @@ export async function runClaudeCode(
     ctx.record({ step: toolCalls, type: "note", detail: `缓存命中 ${usage.cache_read_input_tokens} 输入 token` });
   }
 
-  if (killedFor) throw new Error(killedFor);
+  // Returned, not thrown: a deliberate stop still has salvageable work in it,
+  // and `incomplete` is what keeps the caller from mistaking it for an answer.
+  if (killedFor) {
+    return { text: partialReport(killedFor), steps: toolCalls, incomplete: killedFor };
+  }
 
   if (!final) {
     const tail = stderr.trim().slice(0, 400);
+    const last = notes.at(-1);
     throw new Error(
-      `Claude Code 没有返回结果(退出码 ${exitCode})。${tail ? `stderr: ${tail}` : "无 stderr 输出。"}`,
+      `Claude Code 没有返回结果(退出码 ${exitCode})。${tail ? `stderr: ${tail}` : "无 stderr 输出。"}` +
+        (last ? `\n\n(它中断前最后说过的内容,未完成:)\n${last.slice(0, 800)}` : ""),
     );
   }
 

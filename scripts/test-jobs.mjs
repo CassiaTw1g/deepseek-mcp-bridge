@@ -198,3 +198,91 @@ test("任务失败时,错误原文被保留下来", async () => {
   assert.match(job.error, /reasoning_content/);
   rmSync(stateDir, { recursive: true, force: true });
 });
+
+// --- 提前中止后 salvage -----------------------------------------------------
+
+// 真实的触顶发生在 harness 里(它才数得清模型的工具调用),用真 CLI 才测得到,
+// 那条路在 npm run accept 之外单独验过。这里锁的是分工的另一半:harness 交回来的
+// 半成品,**注册表和 MCP 层不能把它吞掉** —— 吞掉就等于这个修复从未存在:
+// 调用方拿到的仍然只有一行错误,而这正是当初「任务超过 40 步上限,没有产出」的样子。
+
+const SALVAGE = {
+  text: "任务在完成前被中止:任务超过 2 步上限,已中止。\n\n【它最后说过的内容】\n已经读完 a.ts、b.ts,发现 x 处异常被吞。",
+  steps: 41,
+  incomplete: "任务超过 2 步上限,已中止。",
+};
+
+test("提前中止:状态算失败,但已完成的内容必须一起交回来", async () => {
+  const stateDir = tempState();
+  const registry = createRegistry(async () => SALVAGE, { stateDir });
+  const job = registry.start({ task: "t", mode: "code", workspace: ROOT });
+  await job.settled;
+
+  assert.equal(job.state, "error", "半成品不是成品,绝不能报成 done");
+  assert.match(job.error, /步上限/);
+  assert.equal(job.result, undefined, "没有完整结果,就不该有 result");
+  assert.equal(job.partial?.text, SALVAGE.text, "已经查到的内容不能丢");
+  assert.equal(job.partial?.steps, 41, "步数要如实保留");
+  rmSync(stateDir, { recursive: true, force: true });
+});
+
+test("提前中止:半成品必须真的出现在调用方读到的那段文字里", async () => {
+  // 这条才是修复的落点。任务记录里存着 partial,payload 却不渲染它,
+  // 对 ChatGPT 来说两者完全一样 —— 它只读得到 payload。
+  const stateDir = tempState();
+  const registry = createRegistry(async () => SALVAGE, { stateDir });
+  const job = registry.start({ task: "t", mode: "code", workspace: ROOT });
+  await job.settled;
+
+  const server = createMcpServer(registry, createPolicy([ROOT]));
+  const client = new Client({ name: "t", version: "1" });
+  const [ct, st] = InMemoryTransport.createLinkedPair();
+  await Promise.all([client.connect(ct), server.connect(st)]);
+
+  const res = await client.callTool({
+    name: "deepseek_agent_poll",
+    arguments: { job_id: job.id },
+  });
+  const text = res.content.map((c) => c.text).join("\n");
+
+  assert.match(text, /步上限/, "错误原文必须在");
+  assert.match(text, /已经读完 a\.ts/, "半成品正文必须在,否则调用方看到的就是一片空白");
+  assert.match(text, /不是结果/, "必须写明这不是结果 —— 半成品被当成结论是这里唯一真正的风险");
+  assert.ok(!/验证码/.test(text), "失败的任务绝不能带 nonce,那等于给它盖章");
+  assert.ok(!/✅/.test(text), "不能出现完成标记");
+
+  registry.shutdown();
+  await server.close();
+  rmSync(stateDir, { recursive: true, force: true });
+});
+
+test("正常完成的任务不会被 partial 污染", async () => {
+  const stateDir = tempState();
+  const registry = createRegistry(async () => ({ text: "完整结果", steps: 5 }), { stateDir });
+  const job = registry.start({ task: "t", mode: "code", workspace: ROOT });
+  await job.settled;
+  assert.equal(job.state, "done");
+  assert.equal(job.partial, undefined, "成功路径上不该出现半成品字段");
+  assert.equal(job.result?.text, "完整结果");
+  rmSync(stateDir, { recursive: true, force: true });
+});
+
+test("被人手动 kill 的任务,半成品同样保留", async () => {
+  // 走的是线上真正那条路:cancel 哨兵文件(即 `npm run ctl -- job kill`)。
+  // harness 每 500ms 查一次,查到就带着 partial 正常返回,注册表再按「被取消」结账。
+  // 取消是人的决定,不该顺便把已经查到的东西一起扔掉。
+  const stateDir = tempState();
+  const registry = createRegistry(async (_input, ctx) => {
+    await sleep(300);
+    assert.equal(ctx.checkCancelled(), true, "这里应当已经看见 cancel 哨兵");
+    return SALVAGE;
+  }, { stateDir });
+
+  const job = registry.start({ task: "t", mode: "code", workspace: ROOT });
+  writeFileSync(join(stateDir, "cancel", `${job.id}.json`), "{}", "utf8");
+  await job.settled;
+
+  assert.equal(job.state, "cancelled");
+  assert.equal(job.partial?.text, SALVAGE.text, "取消也要把已经做到的部分留下");
+  rmSync(stateDir, { recursive: true, force: true });
+});

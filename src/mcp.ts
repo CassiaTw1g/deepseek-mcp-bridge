@@ -66,6 +66,8 @@ const AGENT_POLL_DESCRIPTION = [
   '- "waiting_approval":任务暂停,在等人批准一条命令。把提示原文转告用户,让他到电脑上处理。',
   '- "done":结束了。此时才有 result 和 nonce,可以报告给用户。',
   '- "error" / "cancelled":失败或被取消。把 error 原文转述给用户,不要自行修饰或淡化。',
+  "  这类返回里可能还带一段「被中止前的半成品记录」。那是原始材料,不是结论:只能贴给用户看",
+  "  并说明任务没跑完,或者用它把任务拆得更小再派一次。绝不能当成本次任务的结果报告。",
 ].join("\n");
 
 const SYNC_WINDOW_MS = 45_000;
@@ -101,6 +103,27 @@ function isTerminal(job: Job): boolean {
   return job.state === "done" || job.state === "error" || job.state === "cancelled";
 }
 
+/**
+ * Salvage from a run that was stopped early, rendered *after* the failure and
+ * fenced with an explicit warning. The dangerous reading is that a survey cut
+ * off halfway is a finished one, so the warning is repeated on both sides.
+ */
+function partialBlock(job: Job): string[] {
+  if (!job.partial?.text) return [];
+  return [
+    "",
+    "────────────",
+    "⚠️ 不过它在被中止前已经做了一部分,下面是原始记录。**这不是结果,也没有核查完整**,",
+    "不能算任务完成,更不要当成结论报告给用户。可以贴给用户看,但必须说明任务没跑完。",
+    "用途:拿这些内容把任务拆得更小(比如只查其中一块)再派一次,比从头重跑省得多。",
+    "────────────",
+    job.partial.text,
+    "────────────",
+    "",
+    "⚠️ 再说一次:上面是被中止的半成品,不是结果。",
+  ];
+}
+
 /** The payload doubles as the instruction — models weight the last result heavily. */
 function jobPayload(job: Job): string {
   if (job.state === "done") {
@@ -118,15 +141,16 @@ function jobPayload(job: Job): string {
 
   if (job.state === "error") {
     return [
-      "❌ 任务失败,没有产出结果。",
+      "❌ 任务失败,没有产出可用结果。",
       "",
       "错误原文(请原样转述给用户,不要修饰,也不要替它猜一个答案):",
       job.error ?? "(无错误信息)",
+      ...partialBlock(job),
     ].join("\n");
   }
 
   if (job.state === "cancelled") {
-    return `⛔ 任务已被取消,没有产出结果。\n\n${job.error ?? ""}`;
+    return [`⛔ 任务已被取消,没有产出结果。`, "", job.error ?? "", ...partialBlock(job)].join("\n");
   }
 
   if (job.state === "waiting_approval") {

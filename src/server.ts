@@ -65,12 +65,23 @@ if (allowedRoots.length === 0) {
  * stateless mode, so a registry built there would forget every job the instant
  * its `start` call returned.
  */
+const stepLimit = Number(process.env.BRIDGE_MAX_STEPS ?? 120);
+const jobTimeoutMs = Number(process.env.BRIDGE_JOB_TIMEOUT_MS ?? 30 * 60_000);
+
 const registry = createRegistry(
   createClaudeCodeRunner({
-    maxSteps: Number(process.env.BRIDGE_MAX_STEPS ?? 40),
-    timeoutMs: Number(process.env.BRIDGE_JOB_TIMEOUT_MS ?? 15 * 60_000),
+    maxSteps: stepLimit,
+    timeoutMs: jobTimeoutMs,
   }),
-  { harnessName: "claude-code" },
+  {
+    harnessName: "claude-code",
+    // The registry's own wall clock must stay *behind* the runner's timeout, or
+    // it becomes the real ceiling — and it reports the loss as a plain
+    // cancellation, which says nothing about why. It used to default
+    // independently to 20 minutes, silently capping any job whose runner had
+    // been given longer than that.
+    hardWallMs: jobTimeoutMs + 60_000,
+  },
 );
 
 const app = express();

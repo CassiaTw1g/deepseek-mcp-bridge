@@ -49,7 +49,7 @@ const JOB_TIMEOUT_MS = Number(process.env.ACCEPT_JOB_TIMEOUT_MS ?? 8 * 60_000);
 // through would make the result unattributable. Test B in particular only
 // proves the model loops if the loop runs to completion on its own.
 const runner = createClaudeCodeRunner({
-  maxSteps: Number(process.env.BRIDGE_MAX_STEPS ?? 40),
+  maxSteps: Number(process.env.BRIDGE_MAX_STEPS ?? 120),
   timeoutMs: JOB_TIMEOUT_MS,
   approval: false,
 });
