@@ -81,7 +81,15 @@ async function rpc(payload) {
   return parseBody(await res.text());
 }
 
-console.log(`目标: ${ENDPOINT}\n`);
+// Masked by default, same rule as `ctl`: this output gets pasted into chat and
+// issue threads, and the secret in it is the whole credential. `--show` when
+// you actually need to read it.
+const mask = (text) =>
+  process.argv.includes("--show")
+    ? String(text)
+    : String(text).replace(/\/mcp\/[0-9a-fA-F]{8,}/g, "/mcp/<密钥已隐藏,加 --show 查看>");
+
+console.log(`目标: ${mask(ENDPOINT)}\n`);
 
 const health = await fetch(`${BASE}/health`)
   .then((r) => r.json())

@@ -85,6 +85,8 @@ check("工具 deepseek_agent_poll 已注册", Boolean(agentPoll));
 check("start 描述写明了必须轮询", startDesc.includes("deepseek_agent_poll"));
 check("start 描述警告不得编造结果", /不要向用户报告任何结论/.test(startDesc));
 check("start 要求 workspace 参数", "workspace" in (agentStart?.inputSchema?.properties ?? {}));
+// mode 曾经在这里但不能生效(harness 不读它)。参数面留着它,调用方就会照着它做计划。
+check("start 不再暴露无效果的 mode 参数", !("mode" in (agentStart?.inputSchema?.properties ?? {})));
 
 // 用一个在两个平台上都真的在范围外的路径。这里不能写 `C:\Windows`:
 // 在 Linux 上那只是个带反斜杠的**相对名**,会被拼到允许根目录里面去,

@@ -15,11 +15,13 @@ export const TOOL_DESCRIPTION = [
   "适用场景:",
   "(1) 需要跨厂商独立复核的任务——安全审查、逻辑反例构造、对某个结论的对抗性验证。把实现或原始材料传进去,但不要传你自己的结论,否则独立性会被污染。",
   "(2) 大批量、低风险的机械性工作:摘要、分类、格式转换、批量文本处理。",
-  "(3) 超长材料(约 1M token)的检索与归纳。",
+  "(3) 中等规模材料的检索与归纳:几万字的文本没问题,再大就要先拆分。",
   "",
   "不适用:需要读取真实文件、需要执行命令、或需要「运行→看报错→修改」多步迭代才能完成的任务——那些用 deepseek_agent_start。",
   "",
-  "本工具无法访问文件系统,所有材料必须以文本形式通过 files 参数传入。",
+  "本工具无法访问文件系统,所有材料必须以文本形式通过 files 参数传入,**单次请求体上限 2MB**",
+  "(材料必须由你原文粘贴进参数,所以要按这个上限裁剪)。DeepSeek 模型本身能读约 1M token,",
+  "**但那是模型的能力,不是这条链路能传进去的量** —— 派发超长材料前请先拆分。",
 ].join("\n");
 
 /**
@@ -208,7 +210,8 @@ export function createMcpServer(registry?: Registry, policy?: SandboxPolicy): Mc
           .string()
           .optional()
           .describe(
-            "要分析或审查的代码/文本材料,纯文本透传。DeepSeek 无法访问你的文件系统,内容必须贴在这里。",
+            "要分析或审查的代码/文本材料,纯文本透传。DeepSeek 无法访问你的文件系统,内容必须贴在这里。" +
+              "单次上限 2MB(请求体上限),超出请先拆分或改用 deepseek_agent_start。",
           ),
       },
     },
@@ -246,15 +249,9 @@ export function createMcpServer(registry?: Registry, policy?: SandboxPolicy): Mc
             .describe(
               "允许子代理操作的目录(绝对路径)。它会以此为根读写文件、执行命令。必须落在服务端允许的根目录内。",
             ),
-          mode: z
-            .enum(MODES)
-            .optional()
-            .describe(
-              "任务类型,当前 harness 不读取该参数(保留仅为兼容)。默认 code。",
-            ),
         },
       },
-      async ({ task, workspace, mode }, extra) => {
+      async ({ task, workspace }, extra) => {
         if (!policy || policy.roots.length === 0) {
           return errorText(
             "agent 工具未配置工作区根目录,出于安全默认拒绝一切路径。\n" +
@@ -273,7 +270,7 @@ export function createMcpServer(registry?: Registry, policy?: SandboxPolicy): Mc
 
         let job: Job;
         try {
-          job = registry.start({ task, mode: mode ?? "code", workspace: admitted.realPath });
+          job = registry.start({ task, workspace: admitted.realPath });
         } catch (err) {
           return errorText(err instanceof Error ? err.message : String(err));
         }

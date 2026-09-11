@@ -35,9 +35,9 @@ jobs:
 
       # Offline and deterministic: the model is a fixture string or a scripted
       # stub, so these run on every push without a key and without spending
-      # anything. Windows-only sandbox escapes self-skip on Linux.
-      - name: Offline test suites (loop, sandbox, approvals, jobs)
-        run: npm run test:loop && npm run test:sandbox && npm run test:approvals && npm run test:jobs
+      # anything. Assertions about Win32 path semantics self-skip on Linux.
+      - name: Offline test suites (loop, sandbox, approvals, guard, jobs)
+        run: npm run test:loop && npm run test:sandbox && npm run test:approvals && npm run test:guard && npm run test:jobs
 
       - name: Self-test (in-memory MCP round trip, no network)
         run: npm run selftest:memory

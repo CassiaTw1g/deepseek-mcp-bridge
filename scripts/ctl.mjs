@@ -151,7 +151,15 @@ function describeEndpoint(env) {
  */
 function mask(text) {
   if (flags.has("--show")) return text;
-  return String(text).replace(/\/mcp\/[0-9a-fA-F]{8,}/g, "/mcp/<密钥已隐藏,加 --show 查看>");
+  let out = String(text).replace(/\/mcp\/[0-9a-fA-F]{8,}/g, "/mcp/<密钥已隐藏,加 --show 查看>");
+
+  // The pattern above only catches a secret in URL shape. Log files, audit
+  // lines and job results are free text: anything the sub-agent ever printed —
+  // `echo $env:MCP_PATH_SECRET`, a prompt-injected file, a stack trace — lands
+  // in them verbatim. So the literal value is masked too, wherever it appears.
+  const secret = process.env.MCP_PATH_SECRET || parseEnvFile().MCP_PATH_SECRET || "";
+  if (secret.length >= 8) out = out.split(secret).join("<密钥已隐藏>");
+  return out;
 }
 
 function preflight() {
@@ -372,7 +380,10 @@ function cmdLogs() {
     return;
   }
   const lines = readFileSync(LOG_FILE, "utf8").split(/\r?\n/);
-  console.log(lines.slice(-40).join("\n"));
+  // Masked line by line, not just when printing our own text: this output is
+  // the one people paste into a bug report, and it is a file we do not fully
+  // control (old lines predate the fix in `server.ts`).
+  console.log(lines.slice(-40).map(mask).join("\n"));
 }
 
 function cmdSecret() {
@@ -534,7 +545,7 @@ function cmdPending() {
   for (const item of items) {
     const waited = Math.round((Date.now() - item.createdAt) / 1000);
     console.log(`  ${item.id}   (任务 ${item.jobId},已等 ${waited} 秒)`);
-    console.log(`    要执行的命令 : ${item.command}`);
+    console.log(`    ${mask(`要执行的命令 : ${item.command}`)}`);
     console.log(`    工作目录     : ${item.cwd}`);
     console.log(`    批准 : npm run ctl -- approve ${item.id}`);
     console.log(`    拒绝 : npm run ctl -- deny ${item.id}`);
@@ -578,12 +589,12 @@ function cmdJobs(id, { trace = false } = {}) {
     console.log(`步数     : ${job.steps}`);
     console.log(`耗时     : ${formatDuration(job)}`);
     console.log(`验证码   : ${job.nonce}`);
-    console.log(`任务内容 : ${job.task}`);
-    if (job.error) console.log(`错误     : ${job.error}`);
+    console.log(`任务内容 : ${mask(job.task)}`);
+    if (job.error) console.log(`错误     : ${mask(job.error)}`);
     if (job.result?.text) {
       console.log("");
       console.log("结果:");
-      console.log(job.result.text);
+      console.log(mask(job.result.text));
     }
     if (trace) {
       console.log("");
@@ -591,7 +602,7 @@ function cmdJobs(id, { trace = false } = {}) {
       for (const e of job.events) {
         const time = new Date(e.at).toISOString().slice(11, 19);
         const name = e.name ? ` ${e.name}` : "";
-        console.log(`  [${time}] #${e.step} ${e.type}${name} ${e.detail ?? ""}`);
+        console.log(mask(`  [${time}] #${e.step} ${e.type}${name} ${e.detail ?? ""}`));
       }
       if (job.events.length === 0) console.log("  (无事件)");
     }
@@ -601,7 +612,7 @@ function cmdJobs(id, { trace = false } = {}) {
   console.log(`${jobs.length} 个任务(最近的在前):\n`);
   for (const job of jobs) {
     console.log(`  ${job.id}  ${job.state.padEnd(17)} ${String(job.steps).padStart(3)} 步  ${formatDuration(job).padStart(8)}  ${job.nonce}`);
-    console.log(`      ${shortTask(job.task)}`);
+    console.log(mask(`      ${shortTask(job.task)}`));
   }
   console.log("\n看某一个任务的完整轨迹:npm run ctl -- jobs <id> --trace");
 }
@@ -632,15 +643,15 @@ function cmdAudit(lines) {
       const e = JSON.parse(row);
       const time = new Date(e.at).toISOString().slice(11, 19);
       if (e.type === "approval_auto") {
-        console.log(`[${time}] 自动放行  ${e.command}`);
+        console.log(mask(`[${time}] 自动放行  ${e.command}`));
       } else if (e.type === "approval_requested") {
-        console.log(`[${time}] 请求批准  ${e.id}  ${e.command}`);
+        console.log(mask(`[${time}] 请求批准  ${e.id}  ${e.command}`));
       } else if (e.type === "approval_decided") {
-        console.log(`[${time}] ${e.decision === "allow" ? "已批准  " : "已拒绝  "} ${e.id}  ${e.reason ?? ""}`);
+        console.log(mask(`[${time}] ${e.decision === "allow" ? "已批准  " : "已拒绝  "} ${e.id}  ${e.reason ?? ""}`));
       } else if (e.type === "approval_timeout") {
         console.log(`[${time}] 超时拒绝  ${e.id}`);
       } else {
-        console.log(`[${time}] ${e.type}  ${JSON.stringify(e).slice(0, 160)}`);
+        console.log(mask(`[${time}] ${e.type}  ${JSON.stringify(e).slice(0, 160)}`));
       }
     } catch {
       console.log(row);

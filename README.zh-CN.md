@@ -75,6 +75,16 @@ ChatGPT (Sol) ──HTTPS──▶ Cloudflare 边缘 ──隧道──▶ 本�
                                                   网络上够不着)──▶ 你,通过 `npm run ctl`
 ```
 
+工具调用到达那个审批提示之后,按三类分流——这个分法本身就是重点:
+
+| 工具类别 | 规则 |
+|---|---|
+| **命令**(`Bash`、`PowerShell`) | 预放行的**命令名**无人值守直接跑;其余一律暂停等人工。 |
+| **文件工具**(`Read`、`Write`、`Edit`、`NotebookEdit`、`Glob`、`Grep`) | 路径对着该任务的工作区检查。区内无人值守;区外暂停等人工。 |
+| **联网工具**(`WebFetch`、`WebSearch`) | 无论工作区是什么,一律人工。 |
+
+中间这一行**不是** `--add-dir` 在管。`--add-dir` 只是**追加**一个可访问目录,它什么都不限制。边界来自把文件工具写进 harness 的 `permissions.ask`——这是在无头模式下唯一能让 `--permission-prompt-tool` 真的被调用的开关(实测过,不是推测)。在这之前,一个工作区是 `D:\项目` 的任务可以直接 `Read C:\Users\你\.env`,连提示都没有。
+
 - **传输**:MCP Streamable HTTP,无状态(`sessionIdGenerator: undefined`,每个请求新建 server + transport,调用方之间不串数据)。但**任务注册表刻意不是每请求一个**——它整个进程只建一次,否则 `start` 一返回,任务就被忘光了。
 - **响应以 SSE 流式返回**,而不是缓冲成 JSON。这能让字节持续在链路上流动,避免 Cloudflare 免费版对长 DeepSeek 调用报 **524** 超时。
 - **鉴权**:能力 URL。MCP 端点是 `/mcp/<64 位 hex 密钥>`,**路径本身就是凭证**。裸 `/mcp` 和任何错误路径都返回 **404**,与"这里什么都没有"不可区分——因为 ChatGPT 的 connector 表单**没有填 Bearer token 的字段**。
@@ -144,7 +154,7 @@ npm run tunnel    # cloudflared 快速隧道;打印公网 URL 和完整的 MCP �
 |---|---|---|---|
 | `task` | string | 是 | 具体任务。写清目标、约束、期望的输出格式。独立复核场景下**不要在此透露你自己的结论**——那会污染独立性。 |
 | `mode` | enum | 否 | `analyze` \| `review` \| `code` \| `summarize`,选择系统提示词。默认 `analyze`。 |
-| `files` | string | 否 | 要分析/审查的代码或文本,纯文本透传。**这个工具无法访问你的文件系统**——内容必须贴在这里。 |
+| `files` | string | 否 | 要分析/审查的代码或文本,纯文本透传。**这个工具无法访问你的文件系统**——内容必须贴在这里。另外它受服务端 **2 MB** 请求体上限的约束:模型的上下文窗口约 1M token,但**这条链路能传进去的量不是那个数**。 |
 
 每个 `mode` 有独立的系统提示词。`review` 明确要求模型把材料中作者的结论视为**未经证实的声明**,并显式列出不同意之处——这正是把它路由到外部厂商的意义所在。
 
@@ -183,7 +193,7 @@ npm run tunnel    # cloudflared 快速隧道;打印公网 URL 和完整的 MCP �
 | `MCP_PATH_SECRET` | — | **必填**,至少 16 字符。能力路径段。`npm run ctl -- secret` 生成 32 字节 hex。 |
 | `PORT` | `8787` | 本地监听端口。 |
 | `HOST` | `127.0.0.1` | 监听地址。**保持回环**——隧道跑在同一台机器上,把端口暴露到局域网没有任何好处。 |
-| `RATE_LIMIT_PER_MINUTE` | `20` | 每 IP 滑动窗口。URL 泄漏时限制爆炸半径。 |
+| `RATE_LIMIT_PER_MINUTE` | `60` | 滑动窗口,URL 泄漏时限制爆炸半径。**全局一个桶,不是每 IP 的**——服务监听在回环,连进来的只有隧道,所以 `X-Forwarded-For` 是调用方随手写的;信它等于把限流变成"每个假 IP N 次"。只计 `tools/call`:一次轮询可能算三次请求(initialize / tools/list / call),把握手算进去的话,长任务会被自己的轮询打成 429。 |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | OpenAI 兼容端点。 |
 | `DEEPSEEK_MODEL` | `deepseek-flash` | 模型 ID。 |
 | `DEEPSEEK_TIMEOUT_MS` | `90000` | 服务端超时;返回结构化错误而不是挂住。保持在 Cloudflare 100 秒边缘超时以下。 |
@@ -199,11 +209,12 @@ npm run tunnel    # cloudflared 快速隧道;打印公网 URL 和完整的 MCP �
 | `BRIDGE_MAX_STEPS` | `120` | 每个任务的步数上限(一次工具调用 = 一步)。撞上它任务仍然会停,但**已经读到的内容会作为半成品回传**,不是一片空白。它是防失控的刹车,不是工作量指标——把项目通读一遍的审查轻松超过 40 步,然后死在收尾之前。 |
 | `BRIDGE_JOB_TIMEOUT_MS` | `1800000` | 墙钟上限(30 分钟)。超时会连同整个子进程树一起结束。`server.ts` 会把注册表自己那道硬墙设成这里 +1 分钟,保证 runner 的超时永远先响——反过来硬墙赢了的话,它会把中止报成一句*已取消*,看不出原因。 |
 | `BRIDGE_APPROVAL_TIMEOUT_MS` | `300000` | 一条命令等人工处理多久(5 分钟)。**超时即拒绝。** |
-| `BRIDGE_APPROVE_ALLOW` | 见 `DEFAULT_ALLOW` | 逗号分隔的预放行**命令名**——`node` `npm` `git` `dir` `type` 等,加上 PowerShell 的只读 cmdlet。**只比对第一个词**,约束的是"哪个程序",不是它的参数。名单外的一律暂停等人工。 |
+| `BRIDGE_APPROVE_ALLOW` | 见 `DEFAULT_ALLOW` | 逗号分隔的预放行**命令名**——`node` `npm` `git` `dir` `type` 等,加上 PowerShell 的只读 cmdlet。**只比对第一个词**,约束的是"哪个程序",不是它的参数。名单外的一律暂停等人工。注意它只管**命令**:工作区外的文件读写、以及任何联网工具,无论名单里有什么,都必须人工批准。 |
 | `BRIDGE_CC_APPROVAL` | 开 | 设为 `off` 会整个跳过审批队列——之后所有命令无人值守直接执行。只给 `npm run accept` 用。 |
 | `BRIDGE_CLAUDE_BIN` | `PATH` 上的 `claude` | Claude Code 可执行文件路径。 |
 | `BRIDGE_ANTHROPIC_BASE_URL` | `$DEEPSEEK_BASE_URL/anthropic` | harness 把请求发到哪里。 |
 | `BRIDGE_STATE_DIR` | `<项目目录>/.state` | 任务快照、审批队列、审计日志的位置。 |
+| `BRIDGE_WORKSPACE` | *(自动注入)* | 由 harness 按任务注入,一个任务一个值——审批服务靠它知道自己在守哪条边界。**不要手工设置。** |
 | `BRIDGE_CC_MAX_BUDGET_USD` | *(未设)* | 可选的 harness `--max-budget-usd`。默认关掉**是因为 Claude Code 按 Claude 的价格计费**——这里设的限额读数约等于真实 DeepSeek 花费的 100 倍,会把任务提前掐断。 |
 
 ## 生命周期命令
@@ -292,6 +303,7 @@ npm test
 | `test:loop` | 响应解析与请求计数。一个工具回合**不得**被发两次;`reasoning_content` 必须活着回到下一个请求,否则 API 直接 400。 |
 | `test:sandbox` | 路径逃逸回归:UNC、`\\?\`、NTFS 备用数据流、保留设备名、尾随点、前缀边界、junction。Windows 专有项在别的平台自动跳过;硬链接缺口被断言为**成功**,而不是假装它不存在。 |
 | `test:approvals` | 审批协议:自动放行规则、串联命令的拒绝,以及**所有非人工出口——超时、被取消、决定文件损坏——一律归为拒绝**。 |
+| `test:guard` | 文件工具的工作区边界:区内路径放行;区外路径、父级回溯、前缀相同的兄弟目录、UNC 与备用数据流一律转人工;`Grep` 的正则不被误判成路径。断言 Win32 路径语义的那几条在非 Windows 上自动跳过,理由和 `test:sandbox` 一样。 |
 | `test:jobs` | 任务注册表。最要紧的一条:**客户端断线不得杀掉任务**——因为 MCP SDK 会在客户端挂断时 abort 当前请求处理器。 |
 | `selftest:memory` | 内存内 MCP 往返;agent 工具已注册,且越界工作区会被拒。 |
 
@@ -371,8 +383,9 @@ B 是承重的那一根。该套件刻意关掉了审批,所以它不进 `npm te
 始终生效。
 
 - **路径密钥就是凭证。** 拿到 URL 的任何人都能花你的 DeepSeek 额度。当作密码对待;用 `npm run ctl -- secret` 轮换。
+- **桥自己不会把密钥写下来。** 启动行、`ctl logs`、`ctl audit`、`ctl jobs` 都渲染成 `<密钥已隐藏>`,`smoke` 也一样。理由一点也不高级:这个项目**唯一一次真实泄漏就来自它自己的日志文件**,不是被人猜到的。每一份打印出来的副本都活得比那一刻长——scrollback、终端记录、粘进工单里的日志。
 - **绑定回环地址。** `HOST` 默认 `127.0.0.1`。不要设成 `0.0.0.0`。
-- **限流**默认开启,URL 泄漏时限制滥用。
+- **限流**默认开启,URL 泄漏时限制滥用。它是**全局的 `tools/call` 桶**,不是每 IP 窗口——为什么"每 IP"在这里比没用还糟,见变量表。
 - **DeepSeek 消费上限**是最后一道防线——去控制台设上。
 - **使用独立的 API key。** 不要复用其他工具依赖的 key;桥接 key 泄漏时应能独立撤销而不产生连带损失。
 
@@ -385,14 +398,17 @@ B 是承重的那一根。该套件刻意关掉了审批,所以它不进 `npm te
 | 你放出去的能力 | 拿到 URL 的人能做到什么 |
 |---|---|
 | 什么都不开(默认) | 花掉你的 DeepSeek 额度。**碰不到你的电脑。** |
-| 设了 `DEEPSEEK_ALLOWED_ROOTS` | 读、改那些根目录下的文件 |
+| 设了 `DEEPSEEK_ALLOWED_ROOTS` | 读、改那些根目录下的文件;对它们**之外**的读写会停下来等你批准,而不是被直接拒掉 |
 | ……再加上执行命令 | **跑任意命令 —— 那就是这台机器** |
 
 护栏如下,以及同样重要的——[它们**不是**什么](SECURITY.md#honest-limits--these-are-not-guarantees):
 
 - **失败即拒绝。** 没设 `DEEPSEEK_ALLOWED_ROOTS` 就是拒绝一切工作区,永远不会"默认任意路径"。
 - **每个工作区都必须过 `src/sandbox.ts`**——它是唯一把调用方给的字符串变成真实路径的地方。
+- **文件工具被约束在工作区内**,由 `src/harness/file-guard.ts` 复用同一个 `sandbox.admit()` 实现——所以 junction、8.3 短名、UNC、备用数据流、尾随点这些是**一份**实现配**一套**回归测试(`npm run test:guard`),而不是另写一份更弱的。修复前后实测:工作区是 `D:\项目` 的任务,过去能在 2 步内读完几层目录之外的一个文件、不弹任何提示、还把内容拷回工作区;现在它会停在 `waiting_approval`,而内容从未进入这次运行。工作区**内**的读写照旧无人值守,常规路径没有被拖慢。
 - **名单外的命令会暂停任务等人处理。** 无人应答即拒绝,没有"默认放行"这条路;审批通道是 harness 的 stdio 子进程,不是能力 URL 上的端点——否则调用方就能自己批准自己的命令。
+- **联网工具一律人工。** `WebFetch` / `WebSearch` 不能被预放行,也不归工作区管——工作区管的是**进什么**,而原设计里没有任何东西管**出什么**。
+- **子进程环境里的凭证被清掉了。** `claude-code.ts` 在 spawn harness 之前,按名字删掉一切看着像密钥的继承变量(`API_KEY` / `_KEY` / `SECRET` / `TOKEN` / `PASSWORD` / `CREDENTIAL`……),于是一句被预放行的 `node -e "console.log(process.env.X)"` 再也拿不到桥自己的 key,也拿不到别的工具的。**有一个变量是刻意保留的**:`ANTHROPIC_AUTH_TOKEN`——它**就是**那把 DeepSeek key,harness 没有它根本调不了模型。那就把它当作"子代理读得到的东西"来对待:专用、可撤销、有消费上限——因为事实如此。
 - **步数、时长、进程树三重上限**。触顶的任务以 `error` 结算、**不给 nonce**(所以不能算完成),但它已经读到的内容会作为**半成品**回传——刹车不该顺便把已完成的工作也扔掉。外加 `.state/audit.log` 审计日志。
 - **清空 `DEEPSEEK_ALLOWED_ROOTS` 并重启即可退回第一层。** 这是受支持的配置,也是推荐的起步方式:先只读跑一段时间,确认 URL 没泄漏,再考虑打开。
 

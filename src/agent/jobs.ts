@@ -1,3 +1,4 @@
+import { randomInt } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -65,7 +66,13 @@ export interface Job {
 
 export interface JobInput {
   task: string;
-  mode: DeepSeekMode;
+  /**
+   * Recorded, not honoured: the Claude Code harness picks its own behaviour
+   * from the task text. The `deepseek_agent_start` schema no longer offers it —
+   * a parameter that does nothing is worse than no parameter, because the
+   * caller plans around it. Kept here because it is part of the job record.
+   */
+  mode?: DeepSeekMode;
   workspace: string;
 }
 
@@ -117,17 +124,22 @@ const MAX_EVENTS = 400;
  * a caller confabulating a result it never got: the value is returned *only* in
  * the terminal payload, so "I have the answer" is checkable rather than
  * rhetorical.
+ *
+ * `randomInt`, not `Math.random`: the nonce is the one value in this system
+ * that an interested party might want to *predict*. Math.random is not
+ * cryptographic, and 74 bits of predictable output is not the same thing as 74
+ * bits of entropy. Cheap to fix, so it is fixed.
  */
 function makeNonce(): string {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  const pick = () => alphabet[Math.floor(Math.random() * alphabet.length)];
+  const pick = () => alphabet[randomInt(alphabet.length)];
   const block = () => pick() + pick() + pick() + pick();
   return `${block()}-${pick()}${pick()}${pick()}`;
 }
 
 function makeJobId(): string {
   const t = Date.now().toString(36);
-  const r = Math.random().toString(36).slice(2, 8);
+  const r = randomInt(0, 36 ** 6).toString(36).padStart(6, "0");
   return `${t}-${r}`;
 }
 
@@ -151,7 +163,11 @@ export function createRegistry(run: JobRunner, opts: RegistryOptions = {}): Regi
   // never use it, which read as "the registry enforces 24 steps" while the real
   // ceiling lived somewhere else entirely.
   const hardWallMs = opts.hardWallMs ?? 20 * 60_000;
-  const resultTtlMs = opts.resultTtlMs ?? 10 * 60_000;
+  // Matched to the runner's default job timeout (30 min) rather than the 10
+  // minutes this used to be: a job that ran for 25 minutes and finished could
+  // be swept before its caller ever polled, and "找不到任务" reads like a lost
+  // result — the natural response is to dispatch the whole thing again.
+  const resultTtlMs = opts.resultTtlMs ?? 30 * 60_000;
   const harnessName = opts.harnessName ?? "unknown";
 
   const stateDir = opts.stateDir ?? STATE_DIR;
@@ -224,7 +240,7 @@ export function createRegistry(run: JobRunner, opts: RegistryOptions = {}): Regi
         nonce: makeNonce(),
         state: "running",
         task: input.task,
-        mode: input.mode,
+        mode: input.mode ?? "code",
         workspace: input.workspace,
         harness: harnessName,
         startedAt: Date.now(),

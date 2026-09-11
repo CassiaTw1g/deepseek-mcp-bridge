@@ -75,6 +75,16 @@ ChatGPT (Sol) ──HTTPS──▶ Cloudflare edge ──tunnel──▶ bridge 
                                                     never reachable over the URL) ──▶ you, via `npm run ctl`
 ```
 
+Once a tool call reaches that approval prompt it is routed one of three ways, and the split is the point:
+
+| Tool class | Rule |
+|---|---|
+| **Commands** (`Bash`, `PowerShell`) | Pre-approved *names* run unattended; everything else pauses for a human. |
+| **File tools** (`Read`, `Write`, `Edit`, `NotebookEdit`, `Glob`, `Grep`) | Path checked against the job's workspace. Inside runs unattended; outside pauses for a human. |
+| **Network tools** (`WebFetch`, `WebSearch`) | Always a human, regardless of workspace. |
+
+`--add-dir` is not what enforces the middle row. It only *adds* an accessible directory; it restricts nothing. The boundary comes from listing the file tools in the harness's `permissions.ask`, which is the only knob that makes `--permission-prompt-tool` fire in headless mode — measured, not assumed. Before that, a job whose workspace was `D:\project` could `Read C:\Users\you\.env` with no prompt at all.
+
 - **Transport**: MCP Streamable HTTP, stateless (`sessionIdGenerator: undefined`, a fresh server + transport per request so callers never share state). The **job registry is deliberately not per-request** — it is created once per process, or every job would be forgotten the moment its `start` call returned.
 - **Responses stream as SSE** rather than buffered JSON. This keeps bytes moving on the wire, which avoids Cloudflare's free-tier **524** timeout on long DeepSeek calls.
 - **Auth**: a **capability URL**. The MCP endpoint is `/mcp/<64-hex-secret>`; the path *is* the credential. The bare `/mcp` path and any wrong path return **404**, indistinguishable from nothing being there — because ChatGPT's connector form has no Bearer-token field.
@@ -144,7 +154,7 @@ Three tools in two groups. All three are always registered — but until `DEEPSE
 |---|---|---|---|
 | `task` | string | yes | The concrete task. State the goal, constraints, and expected output format. For independent review, **do not reveal your own conclusion here** — it contaminates the independence. |
 | `mode` | enum | no | `analyze` \| `review` \| `code` \| `summarize`. Selects the system prompt. Default `analyze`. |
-| `files` | string | no | The code/text to analyse, passed through as plain text. This tool **cannot access your filesystem** — content must be inlined here. |
+| `files` | string | no | The code/text to analyse, passed through as plain text. This tool **cannot access your filesystem** — content must be inlined here. Subject to the server's **2 MB** request-body cap: the model's context window is ~1M tokens, but that is not how much this path can carry in. |
 
 Each `mode` gets a distinct system prompt. `review` explicitly instructs the model to treat any author conclusion in the material as an unverified claim and to state disagreements explicitly — that is the point of routing to an external vendor.
 
@@ -183,7 +193,7 @@ All via `.env` (gitignored):
 | `MCP_PATH_SECRET` | — | **Required**, min 16 chars. The capability path segment. `npm run ctl -- secret` generates a 32-byte hex value. |
 | `PORT` | `8787` | Local listen port. |
 | `HOST` | `127.0.0.1` | Listen address. **Leave on loopback** — the tunnel runs on the same machine, so exposing the port to your LAN has no upside. |
-| `RATE_LIMIT_PER_MINUTE` | `20` | Per-IP sliding window. Limits the blast radius if the URL leaks. |
+| `RATE_LIMIT_PER_MINUTE` | `60` | Sliding window that limits the blast radius if the URL leaks. **One global bucket, not per IP** — the server listens on loopback and the only client is the tunnel, so `X-Forwarded-For` is whatever the caller typed, and trusting it would make the limit read as "N/min per made-up IP". Only `tools/call` is counted: a single poll can cost three requests (initialize, tools/list, call), so counting handshakes would let a long job 429 itself with its own polling. |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | OpenAI-compatible endpoint. |
 | `DEEPSEEK_MODEL` | `deepseek-flash` | Model ID. |
 | `DEEPSEEK_TIMEOUT_MS` | `90000` | Server-side timeout; returns a structured error instead of hanging. Kept under Cloudflare's 100 s edge timeout. |
@@ -199,11 +209,12 @@ All via `.env` (gitignored):
 | `BRIDGE_MAX_STEPS` | `120` | Step ceiling per job (one tool call = one step). A job that hits it still stops, but what it had already read comes back as a **partial** result instead of nothing. It is a runaway brake, not a work estimate — a review that walks a whole project passes 40 steps easily and dies just short of the end. |
 | `BRIDGE_JOB_TIMEOUT_MS` | `1800000` | Wall-clock ceiling (30 min). On expiry the job and its entire process tree are killed. `server.ts` sets the registry's own hard wall to this value + 1 min so the runner's timeout always fires first — if the hard wall won the race it would report the stop as a plain *cancellation*, which says nothing about why. |
 | `BRIDGE_APPROVAL_TIMEOUT_MS` | `300000` | How long a command waits for a human (5 min). **Expiry is a deny.** |
-| `BRIDGE_APPROVE_ALLOW` | see `DEFAULT_ALLOW` | Comma-separated pre-approved command *names* — `node`, `npm`, `git`, `dir`, `type`, … plus PowerShell's read-only cmdlets. Matched against the **first word only**, so it constrains the program, not its arguments. Anything else pauses the job for a human. |
+| `BRIDGE_APPROVE_ALLOW` | see `DEFAULT_ALLOW` | Comma-separated pre-approved command *names* — `node`, `npm`, `git`, `dir`, `type`, … plus PowerShell's read-only cmdlets. Matched against the **first word only**, so it constrains the program, not its arguments. Anything else pauses the job for a human. This list covers **commands only**: file access outside the workspace, and every network tool, goes to a human regardless. |
 | `BRIDGE_CC_APPROVAL` | on | Set to `off` to skip the approval queue entirely — every command then runs unattended. Only for `npm run accept`. |
 | `BRIDGE_CLAUDE_BIN` | `claude` on `PATH` | Path to the Claude Code binary. |
 | `BRIDGE_ANTHROPIC_BASE_URL` | `$DEEPSEEK_BASE_URL/anthropic` | Where the harness sends its requests. |
 | `BRIDGE_STATE_DIR` | `<repo>/.state` | Job snapshots, approval queue, audit log. |
+| `BRIDGE_WORKSPACE` | *(injected)* | Set by the harness, one value per job — it is how the approval prompt learns the boundary it is enforcing. **Do not set it by hand.** |
 | `BRIDGE_CC_MAX_BUDGET_USD` | *(unset)* | Opt-in `--max-budget-usd` for the harness. Left off by default **because Claude Code prices at Claude rates** — a limit set here reads as roughly 100× the real DeepSeek cost and would cut jobs off early. |
 
 ## Lifecycle commands
@@ -292,6 +303,7 @@ npm test
 | `test:loop` | Response parsing and request accounting. A tool-call turn must not be sent twice; `reasoning_content` must survive back into the next request or the API returns 400. |
 | `test:sandbox` | Path-escape regressions: UNC, `\\?\`, alternate data streams, reserved device names, trailing dots, prefix boundaries, junctions. Windows-only cases self-skip elsewhere, and the hardlink gap is asserted as *success* rather than pretended away. |
 | `test:approvals` | The approval protocol: auto-approval rules, chaining refusal, and that every non-human exit — timeout, cancellation, a corrupt decision file — resolves to **deny**. |
+| `test:guard` | The workspace boundary for file tools: in-workspace paths allowed, out-of-workspace paths, parent traversal, prefix-sibling directories, UNC and alternate data streams all sent to a human; `Grep`'s regex not mistaken for a path. Assertions about Win32 path semantics self-skip off Windows, for the same reason `test:sandbox` has them. |
 | `test:jobs` | The registry. Chiefly: **a client disconnect must not kill the job**, because the MCP SDK aborts per-request handlers when a client hangs up. |
 | `selftest:memory` | In-memory MCP round trip; the agent tools are registered and reject an out-of-scope workspace. |
 
@@ -371,8 +383,9 @@ Read this before exposing anything. It has two tiers, and they defend completely
 Applies always.
 
 - **The path secret is the credential.** Anyone with the URL can spend your DeepSeek quota. Treat it like a password; rotate with `npm run ctl -- secret`.
+- **The secret is never written down by the bridge itself.** The startup line, `ctl logs`, `ctl audit` and `ctl jobs` all render it as `<密钥已隐藏>`, and `smoke` masks it too. The reason is unglamorous: the only real leak this project has had came from the bridge's own log file, not from anyone guessing it. Every printed copy outlives the moment — scrollback, a transcript, a log pasted into a bug report.
 - **Bind to loopback.** `HOST` defaults to `127.0.0.1`. Do not set `0.0.0.0`.
-- **Rate limiting** is on by default and caps abuse if the URL leaks.
+- **Rate limiting** is on by default and caps abuse if the URL leaks. It is a **global bucket of `tools/call` requests** rather than a per-IP window — see the variable table for why the per-IP framing was worse than useless here.
 - **A DeepSeek spend cap** in the provider console is the final backstop — set it.
 - **Use a separate API key.** Do not reuse a key that other tools depend on; a leaked bridge key should be revocable without collateral damage.
 
@@ -385,14 +398,17 @@ Out of the box the bridge is still read-only — the agent tools refuse every wo
 | What you enable | What the holder of the URL can do |
 |---|---|
 | Nothing (default) | Spend your DeepSeek quota. **Cannot touch your computer.** |
-| `DEEPSEEK_ALLOWED_ROOTS` set | Read and modify files under those roots |
+| `DEEPSEEK_ALLOWED_ROOTS` set | Read and modify files under those roots; reads and writes *outside* them pause for your approval rather than being blocked outright |
 | …plus command execution | **Run arbitrary commands — that is the machine** |
 
 The guardrails, and — just as importantly — [what they are *not*](SECURITY.md#honest-limits--these-are-not-guarantees):
 
 - **Fail closed.** No `DEEPSEEK_ALLOWED_ROOTS` means every workspace is denied, never "anywhere by default".
 - **Every workspace goes through `src/sandbox.ts`**, which is the only place a caller-supplied string becomes a real path.
+- **File tools are held to the workspace** by `src/harness/file-guard.ts`, which reuses that same `sandbox.admit()`, so junctions, 8.3 short names, UNC paths, alternate data streams and trailing dots are one implementation with one regression suite (`npm run test:guard`) rather than a second, weaker copy. Measured before and after: a job whose workspace was `D:\project` used to read a file thousands of directories outside it in two steps with no prompt and copy the contents back into the workspace; it now stops at `waiting_approval` and the content never enters the run. In-workspace reads and writes still run unattended, so nothing was made slower for the normal case.
 - **Commands outside the allow-list pause the job for a human.** Unanswered means deny; there is no default-allow path, and the approval channel is a stdio child of the harness rather than an endpoint on the URL — otherwise a caller could approve its own commands.
+- **Network tools always go to a human.** `WebFetch` and `WebSearch` cannot be pre-approved and are not covered by the workspace at all — the workspace governs what comes *in*, and nothing in the original design governed what goes *out*.
+- **The sub-agent's environment is scrubbed of your credentials.** `claude-code.ts` deletes every inherited variable whose name looks like a secret (`API_KEY`, `_KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `CREDENTIAL`…) before spawning the harness, so a pre-approved `node -e "console.log(process.env.X)"` no longer reaches the bridge's own key, or an unrelated tool's. One variable is deliberately kept: `ANTHROPIC_AUTH_TOKEN`, which *is* the DeepSeek key the harness needs in order to call a model at all. Treat that key as readable-by-the-sub-agent — dedicated, revocable, spend-capped — because it is.
 - **Step, time and process-tree ceilings.** A job that hits one settles as `error` and is given no nonce, so it cannot be mistaken for a finished review — but what it had already read comes back as a partial result. A brake should not also throw away the work that was done. Plus an audit log at `.state/audit.log`.
 - **Clear `DEEPSEEK_ALLOWED_ROOTS` and restart to go back to tier 1.** That is a supported configuration and the recommended place to start: run read-only for a while, confirm the URL has not leaked, and only then consider turning it on.
 

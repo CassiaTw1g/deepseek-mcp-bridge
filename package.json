@@ -21,10 +21,11 @@
     "selftest": "node scripts/selftest.mjs",
     "selftest:memory": "node scripts/selftest-memory.mjs",
     "smoke": "node scripts/smoke.mjs",
-    "test": "npm run typecheck && npm run test:loop && npm run test:sandbox && npm run test:approvals && npm run test:jobs && npm run selftest:memory",
+    "test": "npm run typecheck && npm run test:loop && npm run test:sandbox && npm run test:approvals && npm run test:guard && npm run test:jobs && npm run selftest:memory",
     "test:loop": "node --test scripts/test-loop.mjs",
     "test:sandbox": "node --test scripts/test-sandbox.mjs",
     "test:approvals": "node --test scripts/test-approvals.mjs",
+    "test:guard": "node --test scripts/test-guard.mjs",
     "test:jobs": "node --test scripts/test-jobs.mjs",
     "accept": "node scripts/accept.mjs",
     "typecheck": "tsc --noEmit"

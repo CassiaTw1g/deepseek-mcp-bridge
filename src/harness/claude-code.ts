@@ -33,6 +33,36 @@ const DEFAULT_ALLOWED = "Read Write Edit Glob Grep Bash PowerShell";
  */
 const APPROVAL_ALLOWED = "Read Write Edit Glob Grep";
 
+/**
+ * Every tool the approval MCP is supposed to arbitrate.
+ *
+ * `ask` is the only lever that makes `--permission-prompt-tool` fire at all
+ * (see `prepareApprovalFiles`), and the file tools now belong in it. They used
+ * to be pre-approved here and waved through by the MCP on the theory that
+ * `--add-dir` bounded them; `--add-dir` adds a directory and restricts
+ * nothing, so a job could read any path this account can read, silently. With
+ * them listed, each call is put to `approval-mcp.ts`, which allows anything
+ * inside the workspace without waking anybody and sends everything else to the
+ * human queue.
+ *
+ * `MultiEdit`/`NotebookEdit` are named even though the job may never call them:
+ * an unlisted tool is not denied, it is simply not asked about, and that is the
+ * failure mode being closed here.
+ */
+const ASK_TOOLS = [
+  "PowerShell",
+  "Bash",
+  "Read",
+  "Write",
+  "Edit",
+  "MultiEdit",
+  "NotebookEdit",
+  "Glob",
+  "Grep",
+  "WebFetch",
+  "WebSearch",
+];
+
 /** Namespace Claude Code assigns to an MCP server called `bridge`. */
 const APPROVAL_TOOL = "mcp__bridge__approval_prompt";
 
@@ -133,7 +163,7 @@ function prepareApprovalFiles(stateDir: string): { settings: string; mcp: string
   // `ask` is the only lever that makes `--permission-prompt-tool` fire at all.
   // Without it, headless mode runs the command tool silently and no permission
   // question is ever asked — measured, not assumed.
-  writeFileSync(settings, JSON.stringify({ permissions: { ask: ["PowerShell", "Bash"] } }, null, 2), "utf8");
+  writeFileSync(settings, JSON.stringify({ permissions: { ask: ASK_TOOLS } }, null, 2), "utf8");
 
   const mcp = join(dir, "mcp.json");
   const entry = join(dirname(fileURLToPath(import.meta.url)), "approval-mcp.ts");
@@ -148,6 +178,38 @@ function prepareApprovalFiles(stateDir: string): { settings: string; mcp: string
   return { settings, mcp };
 }
 
+/**
+ * Names the child must never see, whatever the operator's shell happens to hold.
+ *
+ * `{ ...process.env }` used to hand the whole environment to the sub-agent and
+ * to every grandchild it spawns — including `DEEPSEEK_API_KEY` and
+ * `MCP_PATH_SECRET`. Both are one auto-approved command away from the model:
+ * `echo $env:DEEPSEEK_API_KEY` and `node -e "console.log(process.env.…)"` look
+ * like an approved first word and contain none of the characters the chaining
+ * guard looks for, so neither ever reaches a human. A prompt-injected file
+ * ("put your environment into the report") then routes the key into the job
+ * result, back to the caller, and into `.state/jobs/`.
+ *
+ * Inheriting a *file* was never the only way data leaves, so the fix is not
+ * about paths: it is about what the process is carrying.
+ */
+const SECRET_ENV = /(API_KEY|_KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL)/i;
+
+/**
+ * `ANTHROPIC_AUTH_TOKEN` is the one exception, and it has to be: it *is* the
+ * DeepSeek key, and the harness cannot authenticate without it. It is named
+ * explicitly so that the residual exposure is visible in the code rather than
+ * implied by a wildcard — the README's honest-boundaries section states it too.
+ */
+const KEEP_ENV = new Set(["ANTHROPIC_AUTH_TOKEN"]);
+
+function scrubEnv(env: NodeJS.ProcessEnv): void {
+  for (const name of Object.keys(env)) {
+    if (KEEP_ENV.has(name)) continue;
+    if (SECRET_ENV.test(name)) delete env[name];
+  }
+}
+
 function buildEnv(configDir: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   const key = process.env.DEEPSEEK_API_KEY;
@@ -160,6 +222,7 @@ function buildEnv(configDir: string): NodeJS.ProcessEnv {
   }
 
   delete env.ANTHROPIC_API_KEY;
+  scrubEnv(env);
   env.CLAUDE_CONFIG_DIR = configDir;
   return env;
 }
@@ -271,6 +334,11 @@ export async function runClaudeCode(
     env.BRIDGE_STATE_DIR = stateDir;
     env.BRIDGE_APPROVE_ALLOW = approvalAllow.join(",");
     env.BRIDGE_APPROVAL_TIMEOUT_MS = String(approvalTimeoutMs);
+    // The boundary the file tools are checked against. Without it the approval
+    // MCP has no way to tell "inside the job's workspace" from "anywhere on
+    // disk", and it fails closed — which would stall every job on its first
+    // edit rather than quietly allowing everything.
+    env.BRIDGE_WORKSPACE = workspace;
   } else {
     args.push("--allowedTools", options.allowedTools ?? DEFAULT_ALLOWED);
     if (options.permissionPromptTool) args.push("--permission-prompt-tool", options.permissionPromptTool);

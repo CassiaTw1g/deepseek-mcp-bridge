@@ -11,7 +11,21 @@ const PORT = Number(process.env.PORT ?? 8787);
 // business reaching the port — binding 0.0.0.0 would put the endpoint on the LAN.
 const HOST = process.env.HOST ?? "127.0.0.1";
 const PATH_SECRET = process.env.MCP_PATH_SECRET ?? "";
-const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_PER_MINUTE ?? 20);
+/**
+ * One bucket, and it counts only `tools/call`.
+ *
+ * Two things were wrong with the old shape. `trust proxy: true` took `req.ip`
+ * from `X-Forwarded-For`, which the caller writes — so the per-IP limit was a
+ * per-made-up-IP limit, and rotating a header defeated it. With that gone, the
+ * tunnel being on loopback means every caller shares one bucket, i.e. the limit
+ * is now a plain global cap on what a leaked URL can spend.
+ *
+ * The second half is the count. Stateless mode re-runs initialize / tools/list
+ * per request on some clients, so a single poll could cost three hits and a
+ * long job's own polling was what tripped the 429. Those requests are cheap and
+ * change nothing; `tools/call` is where the money and the file writes are.
+ */
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_PER_MINUTE ?? 60);
 const RATE_LIMIT_WINDOW_MS = 60_000;
 
 if (PATH_SECRET.length < 16) {
@@ -85,7 +99,10 @@ const registry = createRegistry(
 );
 
 const app = express();
-app.set("trust proxy", true);
+// No `trust proxy`: this listener is bound to loopback and the only thing that
+// ever connects is the tunnel, so an X-Forwarded-For header carries no
+// information a caller cannot invent. Trusting it turned the rate limit into
+// "20 requests per made-up IP".
 app.use(express.json({ limit: "2mb" }));
 
 app.get("/health", (_req, res) => {
@@ -93,8 +110,10 @@ app.get("/health", (_req, res) => {
 });
 
 app.post(MCP_PATH, async (req, res) => {
-  if (isRateLimited(req.ip ?? "unknown")) {
-    console.log(`[${new Date().toISOString()}] RATE LIMITED ${req.ip}`);
+  const method = req.body?.method ?? "?";
+
+  if (method === "tools/call" && isRateLimited(req.ip ?? "unknown")) {
+    console.log(`[${new Date().toISOString()}] RATE LIMITED`);
     res.status(429).json({
       jsonrpc: "2.0",
       error: { code: -32000, message: "Rate limit exceeded. Try again shortly." },
@@ -105,7 +124,6 @@ app.post(MCP_PATH, async (req, res) => {
 
   // One line per request. This is how you tell "ChatGPT actually called us"
   // apart from "Sol pretended to call us", which looks identical in the chat.
-  const method = req.body?.method ?? "?";
   const toolName = req.body?.params?.name;
   console.log(`[${new Date().toISOString()}] ${method}${toolName ? ` ${toolName}` : ""}`);
 
@@ -160,7 +178,12 @@ app.use("/mcp", (_req, res) => {
 
 const httpServer = app.listen(PORT, HOST, () => {
   console.log(`deepseek-bridge listening on http://${HOST}:${PORT}`);
-  console.log(`MCP endpoint path: ${MCP_PATH}`);
+  // Never the whole path. `ctl` pipes this stdout into `.state/server.log`, and
+  // `ctl logs` prints the tail of that file — a channel that has leaked once
+  // already, and one whose output ends up pasted into troubleshooting threads.
+  // The operator who needs the real value has `ctl status --show`, which reads
+  // it from `.env` and prints it nowhere else.
+  console.log("MCP endpoint path: /mcp/<密钥已隐藏>(完整值:npm run ctl -- status --show)");
 });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {

@@ -1,5 +1,13 @@
 node_modules/
 .env
+# `.env` does not match `.env.bak`, `.env.old`, `.env.local` — and those hold the
+# same live key. The negation keeps the template tracked; everything else that
+# starts with `.env` is a copy of a secret and stays out of the repository.
+.env.*
+!.env.example
+# Hand-edit leftovers. `README.md.bak` is harmless; a copy of a chat log is not
+# — it carries a live tunnel secret, exactly like the file it was copied from.
+*.bak
 *.log
 .state/
 .accept/
