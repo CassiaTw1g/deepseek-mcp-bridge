@@ -1,61 +1,33 @@
 {
-  "name": "deepseek-mcp-bridge",
+  "name": "deepseek-bridge",
   "version": "1.0.0",
-  "description": "MCP server that exposes DeepSeek as a tool for ChatGPT connectors",
+  "private": true,
   "type": "module",
-  "license": "MIT",
-  "engines": {
-    "node": ">=24.0.0"
-  },
-  "keywords": [
-    "mcp",
-    "model-context-protocol",
-    "deepseek",
-    "chatgpt",
-    "connector",
-    "llm",
-    "claude-code"
-  ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/CassiaTw1g/deepseek-mcp-bridge.git"
-  },
-  "bugs": {
-    "url": "https://github.com/CassiaTw1g/deepseek-mcp-bridge/issues"
-  },
-  "homepage": "https://github.com/CassiaTw1g/deepseek-mcp-bridge#readme",
-  "files": [
-    "src",
-    "scripts",
-    "tsconfig.json",
-    ".env.example",
-    "README.md",
-    "README.zh-CN.md",
-    "LICENSE"
-  ],
+  "description": "MCP bridge exposing DeepSeek V4.1 Flash as a tool for ChatGPT Work",
   "scripts": {
     "ctl": "node scripts/ctl.mjs",
     "start": "node scripts/ctl.mjs start",
     "stop": "node scripts/ctl.mjs stop",
     "restart": "node scripts/ctl.mjs restart",
+    "reload": "node scripts/ctl.mjs reload",
     "status": "node scripts/ctl.mjs status",
     "logs": "node scripts/ctl.mjs logs",
-    "enable": "node scripts/ctl.mjs enable",
-    "disable": "node scripts/ctl.mjs disable",
     "tunnel": "node scripts/ctl.mjs tunnel",
     "untunnel": "node scripts/ctl.mjs untunnel",
+    "enable": "node scripts/ctl.mjs enable",
+    "disable": "node scripts/ctl.mjs disable",
     "uninstall": "node scripts/ctl.mjs uninstall",
     "dev": "node src/server.ts",
+    "selftest": "node scripts/selftest.mjs",
+    "selftest:memory": "node scripts/selftest-memory.mjs",
+    "smoke": "node scripts/smoke.mjs",
     "test": "npm run typecheck && npm run test:loop && npm run test:sandbox && npm run test:approvals && npm run test:jobs && npm run selftest:memory",
-    "typecheck": "tsc --noEmit",
     "test:loop": "node --test scripts/test-loop.mjs",
     "test:sandbox": "node --test scripts/test-sandbox.mjs",
     "test:approvals": "node --test scripts/test-approvals.mjs",
     "test:jobs": "node --test scripts/test-jobs.mjs",
-    "selftest": "node scripts/selftest.mjs",
-    "selftest:memory": "node scripts/selftest-memory.mjs",
-    "smoke": "node scripts/smoke.mjs",
-    "accept": "node scripts/accept.mjs"
+    "accept": "node scripts/accept.mjs",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

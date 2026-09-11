@@ -2,8 +2,11 @@
 /**
  * Lifecycle manager for the deepseek-bridge plugin.
  *
- * start / stop / restart / status / enable / disable / logs / uninstall
+ * start / stop / restart / reload / status / enable / disable / logs / uninstall
  * secret / rotate / tunnel / untunnel / jobs / pending / approve / deny / audit
+ *
+ * `reload` restarts the server alone; `restart` also restarts the tunnel, which
+ * changes the public URL.
  *
  * The server is spawned detached so it survives this shell exiting.
  */
@@ -133,6 +136,24 @@ function describeEndpoint(env) {
   };
 }
 
+/**
+ * Hide the path secret in anything headed for stdout.
+ *
+ * The secret is the only credential this bridge has, and every printed copy of
+ * it outlives the moment: terminal scrollback, a shell transcript, a pasted
+ * troubleshooting log, a session with an AI. The one real leak so far came from
+ * this script printing it — twice, from `start` alone — and not from anybody
+ * finding it. So the default is to mask, and `--show` exists for the operator
+ * who genuinely needs to read it.
+ *
+ * `rotate` still puts the *full* URL on the clipboard. A clipboard is not a log,
+ * and it is the reason the printed copy is not needed.
+ */
+function mask(text) {
+  if (flags.has("--show")) return text;
+  return String(text).replace(/\/mcp\/[0-9a-fA-F]{8,}/g, "/mcp/<密钥已隐藏,加 --show 查看>");
+}
+
 function preflight() {
   const env = parseEnvFile();
   const problems = [];
@@ -192,9 +213,10 @@ function cmdStart({ foreground = false } = {}) {
 
   const { local, pathOnly } = describeEndpoint(env);
   console.log(`已启动,PID ${child.pid}`);
-  console.log(`  本地端点 : ${local}`);
-  console.log(`  MCP 路径 : ${pathOnly}`);
+  console.log(`  本地端点 : ${mask(local)}`);
+  console.log(`  MCP 路径 : ${mask(pathOnly)}`);
   console.log(`  日志     : ${LOG_FILE}`);
+  if (!flags.has("--show")) console.log("  (端点里的密钥默认隐藏;要打印完整的加 --show)");
 }
 
 function cmdStop() {
@@ -271,7 +293,7 @@ async function cmdTunnel() {
   if (existing) {
     const url = findTunnelUrl();
     console.log(`隧道已在运行,PID ${existing}`);
-    if (url) console.log(`公网端点 : ${url}/mcp/${state.env.MCP_PATH_SECRET ?? ""}`);
+    if (url) console.log(`公网端点 : ${mask(`${url}/mcp/${state.env.MCP_PATH_SECRET ?? ""}`)}`);
     return;
   }
 
@@ -300,12 +322,13 @@ async function cmdTunnel() {
 
   const full = `${url}/mcp/${env.MCP_PATH_SECRET ?? ""}`;
   console.log("");
-  console.log(`公网端点 : ${full}`);
+  console.log(`公网端点 : ${mask(full)}`);
   console.log(`健康检查 : ${url}/health`);
   console.log("");
   console.log("填进 ChatGPT 网页版 → Settings → Plugins → MCP → Add server:");
   console.log("  类型选 Streamable HTTP,鉴权选「无鉴权 / No authentication」");
-  console.log(`  URL  ${full}`);
+  console.log(`  URL  ${mask(full)}`);
+  if (!flags.has("--show")) console.log("  (密钥默认隐藏;要打印完整 URL 加 --show)");
 }
 
 function cmdStatus() {
@@ -315,11 +338,13 @@ function cmdStatus() {
   const tunnelUrl = findTunnelUrl();
   console.log(`状态     : ${state.disabled ? "已停用 (disabled)" : "已启用 (enabled)"}`);
   console.log(`进程     : ${state.running ? `运行中,PID ${state.pid}` : "未运行"}`);
-  console.log(`本地端点 : ${local}`);
+  console.log(`本地端点 : ${mask(local)}`);
   if (tunnelPid) {
     console.log(`隧道     : 运行中,PID ${tunnelPid}`);
     console.log(
-      `公网端点 : ${tunnelUrl ? `${tunnelUrl}/mcp/${state.env.MCP_PATH_SECRET ?? ""}` : "(地址未知,看 tunnel.log)"}`,
+      `公网端点 : ${
+        tunnelUrl ? mask(`${tunnelUrl}/mcp/${state.env.MCP_PATH_SECRET ?? ""}`) : "(地址未知,看 tunnel.log)"
+      }`,
     );
   } else {
     console.log(`隧道     : 未运行(要接 ChatGPT 就运行 \`npm run tunnel\`)`);
@@ -359,9 +384,11 @@ function cmdSecret() {
       ? body.replace(/^MCP_PATH_SECRET=.*$/m, `MCP_PATH_SECRET=${secret}`)
       : `${body.trimEnd()}\nMCP_PATH_SECRET=${secret}\n`;
     writeFileSync(ENV_FILE, next);
-    console.log(`已写入 .env:MCP_PATH_SECRET=${secret}`);
+    console.log(
+      flags.has("--show") ? `已写入 .env:MCP_PATH_SECRET=${secret}` : "已写入 .env(密钥已隐藏;要打印加 --show)。",
+    );
   } else {
-    console.log(secret);
+    console.log(flags.has("--show") ? secret : "(密钥已隐藏;要打印加 --show)");
   }
   console.log("注意:改动后需要重新启动服务,并同步更新 ChatGPT connector 里的 URL。");
 }
@@ -389,6 +416,53 @@ function copyToClipboard(text) {
  * and a second trip to the ChatGPT connector. Leaving it up means only the
  * last segment of the URL changes.
  */
+/**
+ * Stop the server process, and only the server process.
+ *
+ * `cmdStop` also calls `cmdUntunnel`, which is right when the bridge is being
+ * shut down and wrong for everything else. A quick tunnel is handed a fresh
+ * random hostname on every start, so killing it costs the operator another trip
+ * to the ChatGPT connector to paste a new URL — and nothing about re-reading
+ * `.env`, or picking up edited source, needs that to happen.
+ *
+ * Returns the PID that was stopped, or null if nothing was running.
+ */
+function killServerOnly() {
+  const pid = readPid();
+  if (!pid || !isAlive(pid)) return null;
+  if (isWindows) {
+    spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+  } else {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      /* already gone */
+    }
+  }
+  rmSync(PID_FILE, { force: true });
+  return pid;
+}
+
+/**
+ * Pick up edited source, or a changed `.env`, without disturbing the tunnel.
+ *
+ * The public URL is identical afterwards, so this never needs a matching edit in
+ * the ChatGPT connector. Reach for `npm run restart` only when the tunnel itself
+ * is what needs a new life.
+ */
+function cmdReload() {
+  if (currentStatus().disabled) {
+    console.error("插件处于停用状态。先运行 `npm run enable`。");
+    process.exit(1);
+  }
+  const pid = killServerOnly();
+  console.log(pid ? `已停止旧服务(PID ${pid})。` : "服务本来就没在跑,直接启动…");
+  cmdStart();
+  console.log("");
+  console.log("隧道没动,公网 URL 不变 —— ChatGPT 那边不需要重新粘贴。");
+  console.log("看状态:npm run ctl -- status");
+}
+
 function cmdRotate() {
   const state = currentStatus();
   if (state.disabled) {
@@ -410,22 +484,8 @@ function cmdRotate() {
 
   // Restart only the server. `cmdStart` re-reads .env, so it picks up the new
   // secret on its own — nothing here needs to pass it along.
-  const pid = readPid();
-  if (pid && isAlive(pid)) {
-    if (isWindows) {
-      spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
-    } else {
-      try {
-        process.kill(pid, "SIGTERM");
-      } catch {
-        /* already gone */
-      }
-    }
-    rmSync(PID_FILE, { force: true });
-    console.log(`[2/3] 已停止旧服务(PID ${pid}),用新密钥重启…`);
-  } else {
-    console.log("[2/3] 服务本来就没在跑,直接启动…");
-  }
+  const pid = killServerOnly();
+  console.log(pid ? `[2/3] 已停止旧服务(PID ${pid}),用新密钥重启…` : "[2/3] 服务本来就没在跑,直接启动…");
   cmdStart();
 
   const url = findTunnelUrl();
@@ -434,7 +494,7 @@ function cmdRotate() {
     console.log("[3/3] 隧道没在运行,所以还没有公网地址。");
     console.log("      先运行 `npm run tunnel`,再运行 `npm run ctl -- status`。");
     console.log("      本地端点(只能在这台电脑上用):");
-    console.log(`        ${describeEndpoint(parseEnvFile()).local}`);
+    console.log(`        ${mask(describeEndpoint(parseEnvFile()).local)}`);
     return;
   }
 
@@ -443,12 +503,12 @@ function cmdRotate() {
   console.log("============================================================");
   console.log("  [3/3] 新的公网端点:");
   console.log("");
-  console.log(`  ${full}`);
+  console.log(`  ${mask(full)}`);
   console.log("============================================================");
   console.log(
     copyToClipboard(full)
       ? "已复制到剪贴板 —— 直接粘进 ChatGPT 的 connector 就行。"
-      : "复制失败,请手动选中上面那一行复制。",
+      : "复制失败。加 --show 打印完整 URL,或手动拼:域名 + /mcp/ + .env 里的 MCP_PATH_SECRET。",
   );
   console.log("ChatGPT → Settings → Plugins → MCP → 编辑这个 connector → 换掉 URL。");
 }
@@ -617,6 +677,9 @@ switch (command) {
     cmdStop();
     cmdStart();
     break;
+  case "reload":
+    cmdReload();
+    break;
   case "status":
     cmdStatus();
     break;
@@ -675,6 +738,7 @@ switch (command) {
   start --foreground   前台启动,便于调试
   stop         停止服务和隧道
   restart      重启服务(隧道若在跑会一起停掉,需重新 tunnel)
+  reload       只重启服务,不动隧道 —— 公网 URL 不变,改了代码或 .env 后用这个
   status       查看启用状态、进程、本地与公网端点
   logs         查看最近 40 行日志
   tunnel       启动 Cloudflare 隧道,打印可填进 ChatGPT 的公网 URL
@@ -682,7 +746,11 @@ switch (command) {
   enable       解除停用
   disable      停用并停止服务
   secret       生成并写入 MCP_PATH_SECRET(会同步更新 .env)
+  rotate       换一个 MCP_PATH_SECRET,只重启服务,并把新的完整 URL 放进剪贴板
   uninstall    停止服务并清除本地状态(并提示如何移除 ChatGPT connector)
+
+端点里的密钥默认隐藏成 <密钥已隐藏> —— 每打印一份就多一处留存(终端历史、
+shell 转录、粘到别处的排障记录)。确实要打印时,在命令后加 --show。
 
 子代理任务:
 
