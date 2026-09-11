@@ -70,7 +70,8 @@ Read that twice. The tiers differ by orders of magnitude:
 3. **You cannot read `npm install some-pkg` and know what it does.** That is an honest limitation, not a bug. It does catch the obvious: `curl` posting files outward, registry edits, formats.
 4. **This is not a security boundary — it is an observation window.** The only real boundary is a sandbox or a VM. Be at the machine while jobs run.
 5. **Prompt injection has no fix here.** A file in the workspace that says "ignore your previous instructions" cannot be defended against by any test in this repo. The mitigation that *is* tested is the step and time ceiling.
-6. **Hardlinks are a known gap, tested as success.** `workspace\innocent.txt` can be a hardlink to `.env` in your home directory; a path check cannot see that. The mitigation is structural — hardlinks cannot cross volumes, so keeping the workspace on `D:` and your profile on `C:` isolates them by construction. `test:sandbox` asserts this succeeds, rather than pretending the gap is not there.
+6. **A sub-agent's account of what it did is not evidence, and neither is its account of what it did not do.** It cannot see its own hosting: it runs on DeepSeek's API, so any file content a tool reads into its context is transmitted there on the next model call. Observed in practice — after reading a file, a sub-agent reported "no external transmission occurred, nothing was sent to any external service", which was false in exactly the reassuring direction. The `nonce` defends against a fabricated *result*; nothing defends against a fabricated *reassurance*. If you need to know whether something left the machine, answer it from the architecture — what entered the model's context — never from what the model says.
+7. **Hardlinks are a known gap, tested as success.** `workspace\innocent.txt` can be a hardlink to `.env` in your home directory; a path check cannot see that. The mitigation is structural — hardlinks cannot cross volumes, so keeping the workspace on `D:` and your profile on `C:` isolates them by construction. `test:sandbox` asserts this succeeds, rather than pretending the gap is not there.
 
 ### Going back to tier one
 
@@ -83,7 +84,7 @@ Before exposing the bridge:
 1. Use a **dedicated** DeepSeek API key. Do not reuse a key other tools depend on.
 2. Set a **spend cap** on that key in the DeepSeek console. This is the last line of defence.
 3. Keep `HOST=127.0.0.1`. Do not set `0.0.0.0`.
-4. Rotate `MCP_PATH_SECRET` with `npm run ctl -- secret` if the URL may have leaked, then update the connector URL.
+4. Rotate `MCP_PATH_SECRET` with `npm run ctl -- rotate` if the URL may have leaked — it restarts the server, keeps the tunnel (so the hostname does not change) and puts the new URL on your clipboard. Then update the connector URL.
 5. Never commit `.env`. It is gitignored by default — keep it that way.
 6. **Leave `DEEPSEEK_ALLOWED_ROOTS` empty unless you intend to hand over the machine.** If you do set it, keep the workspace on a volume that does not hold your profile, and be at the keyboard while jobs run.
 

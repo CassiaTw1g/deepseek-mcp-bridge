@@ -190,6 +190,18 @@ npm run uninstall  # stop and clear local state (leaves the project directory)
 
 `npm run start --foreground` runs in the foreground for debugging.
 
+### Rotating the path secret
+
+```bash
+npm run ctl -- rotate
+```
+
+Generates a new secret, restarts **the server only**, and prints the new public URL — which it also copies to your clipboard. The tunnel is deliberately left running: it forwards a port and has no idea what the path is, so the public hostname stays the same and only the last segment of the URL changes. (`npm run restart` would kill the tunnel too, costing you a new hostname and a second trip to the connector.)
+
+Rotate whenever the URL may have been seen by anyone else. It is the only thing standing between your machine and whoever holds it.
+
+On Windows, `windows/7-轮换密钥.bat` does the same thing from a double-click. If you prefer to drive it yourself, `npm run ctl -- secret` writes the secret without restarting anything — you then have to restart and update the connector by hand.
+
 ### Agent job and approval commands
 
 These read the files the server writes, so they work from a second terminal — and they still work if the server was restarted between the request and your answer.
@@ -286,6 +298,8 @@ Avoid the ngrok free tier: its interstitial warning page requires an `ngrok-skip
 | Every agent job fails immediately | Claude Code is not on `PATH`. Install it, or point `BRIDGE_CLAUDE_BIN` at the binary. |
 | Agent job dies partway through | Step ceiling (`BRIDGE_MAX_STEPS`, default 40) or wall clock (`BRIDGE_JOB_TIMEOUT_MS`, default 15 min). `npm run ctl -- jobs <id> --trace` shows the last step reached. |
 | A job you killed shows as `error`, not `cancelled` | That is a bug — a person stopping a job is not a crash. Please report it. |
+| A file-reading task is refused before it reaches the bridge | **ChatGPT's own safety layer, not this bridge.** Sol may refuse to hand a local file to an external model and ask you to authorise it explicitly. Grant it (naming the file and what is in it helps), or reframe the task so the contents never travel back through the chat — have the sub-agent write the result to disk and read it there yourself. Confirm with `npm run ctl -- jobs`: if the list is unchanged, nothing was dispatched. |
+| The sub-agent tells you "nothing left your machine" | **Do not take its word for it.** A sub-agent has no visibility into its own hosting. It runs on DeepSeek's API, so anything a file tool reads into its context is sent there on the next model call — and it will still report that no transmission occurred, because from where it sits the work looked local. Only the architecture answers this question; never the model's own account of it. |
 
 ## Security model
 

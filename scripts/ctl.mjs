@@ -2,7 +2,8 @@
 /**
  * Lifecycle manager for the deepseek-bridge plugin.
  *
- * start / stop / restart / status / enable / disable / logs / uninstall / secret
+ * start / stop / restart / status / enable / disable / logs / uninstall
+ * secret / rotate / tunnel / untunnel / jobs / pending / approve / deny / audit
  *
  * The server is spawned detached so it survives this shell exiting.
  */
@@ -365,6 +366,93 @@ function cmdSecret() {
   console.log("注意:改动后需要重新启动服务,并同步更新 ChatGPT connector 里的 URL。");
 }
 
+/** Best effort. Returns whether it worked, so the caller can say so plainly
+ *  rather than claiming a copy that did not happen. */
+function copyToClipboard(text) {
+  try {
+    if (isWindows) return spawnSync("clip.exe", [], { input: text }).status === 0;
+    const [cmd, args] =
+      process.platform === "darwin" ? ["pbcopy", []] : ["xclip", ["-selection", "clipboard"]];
+    return spawnSync(cmd, args, { input: text }).status === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Rotate the capability secret: new secret, restart the *server only*, hand the
+ * new URL back on the clipboard.
+ *
+ * `cmdStop()` deliberately kills the tunnel as well — correct for `stop`,
+ * wrong here. The tunnel just forwards a port; it has no idea what the path
+ * is, so rotating the secret has no reason to cost you a new public hostname
+ * and a second trip to the ChatGPT connector. Leaving it up means only the
+ * last segment of the URL changes.
+ */
+function cmdRotate() {
+  const state = currentStatus();
+  if (state.disabled) {
+    console.error("插件处于停用状态。先运行 `npm run enable`。");
+    process.exit(1);
+  }
+  if (!existsSync(ENV_FILE)) {
+    console.error(".env 不存在。先复制 .env.example 为 .env 并填写。");
+    process.exit(1);
+  }
+
+  const secret = randomBytes(32).toString("hex");
+  const body = readFileSync(ENV_FILE, "utf8");
+  const next = /^MCP_PATH_SECRET=.*$/m.test(body)
+    ? body.replace(/^MCP_PATH_SECRET=.*$/m, `MCP_PATH_SECRET=${secret}`)
+    : `${body.trimEnd()}\nMCP_PATH_SECRET=${secret}\n`;
+  writeFileSync(ENV_FILE, next);
+  console.log("[1/3] 已生成新密钥并写入 .env。");
+
+  // Restart only the server. `cmdStart` re-reads .env, so it picks up the new
+  // secret on its own — nothing here needs to pass it along.
+  const pid = readPid();
+  if (pid && isAlive(pid)) {
+    if (isWindows) {
+      spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+    } else {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {
+        /* already gone */
+      }
+    }
+    rmSync(PID_FILE, { force: true });
+    console.log(`[2/3] 已停止旧服务(PID ${pid}),用新密钥重启…`);
+  } else {
+    console.log("[2/3] 服务本来就没在跑,直接启动…");
+  }
+  cmdStart();
+
+  const url = findTunnelUrl();
+  if (!readTunnelPid() || !url) {
+    console.log("");
+    console.log("[3/3] 隧道没在运行,所以还没有公网地址。");
+    console.log("      先运行 `npm run tunnel`,再运行 `npm run ctl -- status`。");
+    console.log("      本地端点(只能在这台电脑上用):");
+    console.log(`        ${describeEndpoint(parseEnvFile()).local}`);
+    return;
+  }
+
+  const full = `${url}/mcp/${secret}`;
+  console.log("");
+  console.log("============================================================");
+  console.log("  [3/3] 新的公网端点:");
+  console.log("");
+  console.log(`  ${full}`);
+  console.log("============================================================");
+  console.log(
+    copyToClipboard(full)
+      ? "已复制到剪贴板 —— 直接粘进 ChatGPT 的 connector 就行。"
+      : "复制失败,请手动选中上面那一行复制。",
+  );
+  console.log("ChatGPT → Settings → Plugins → MCP → 编辑这个 connector → 换掉 URL。");
+}
+
 // --- 任务与审批 -------------------------------------------------------------
 //
 // The server writes these to disk precisely so this script can read them. When
@@ -543,6 +631,9 @@ switch (command) {
     break;
   case "secret":
     cmdSecret();
+    break;
+  case "rotate":
+    cmdRotate();
     break;
   case "tunnel":
     await cmdTunnel();
