@@ -330,19 +330,26 @@ npm run ctl -- reload
 
 快速隧道之所以是默认,是因为它零配置。如果你有一个域名、且它的 NS 已经指向 Cloudflare,就能拿到一个**重启、重开机、`restart` 之后都不变**的地址——connector 建一次,以后再也不用碰。
 
+三步里有两步在 Cloudflare 控制台上、只有你能做。**先建隧道**:`Networking → Tunnels → Create a tunnel`(老教程里写的 `Zero Trust → Networks → Connectors` 现在跳到同一个页面);**再加路由**,在该隧道的 `Routes(路由)` 标签下:
+
+```
+Networking → Tunnels → 这条隧道 → Routes(路由) → Add route
+  → Published application(已发布的应用)
+  子域名(Subdomain) : mcp
+  域(Domain)        : 你的域名
+  Service 类型      : HTTP
+  Service URL       : http://localhost:8787
+```
+
+DNS 记录和证书 Cloudflare 会自己建,**不要再手工加一条**。然后把页面上那串很长的 token 复制下来,回本机:
+
 ```bash
 npm run ctl -- tunnel named mcp.example.com
 ```
 
-它会问你要隧道 token(粘进去就行,**别手抄进文件**),替你写好 `.env`,然后告诉你那件只有你能做的事:
+它会问你要隧道 token(粘进去就行,**别手抄进文件**),替你写好 `.env`。Windows 上双击 `windows/11-固定域名.bat` 是同一件事:它把控制台那几步打出来,问你要域名和 token,并在你确认路由已存好后问要不要当场切过去。
 
-```
-Zero Trust → Networks → Tunnels → 这条隧道 → Public Hostname → Add
-  Service 类型 : HTTP
-  Service URL  : localhost:8787
-```
-
-⚠️ **漏掉这一步就是那个坑。** 漏了的话,隧道会报"已连上边缘"、本机看着一切正常,但打开那个域名是 404——因为"域名 → 本地端口"这条路由在 Cloudflare **云端**,不在本机。`npm run ctl -- tunnel check` 会把你还没做的部分列出来,而且把"已注册到边缘"和"域名真的能应答"**分开报**,因为那是两件不同的事实。
+⚠️ **漏掉加路由这一步就是那个坑。** 漏了的话,隧道会报"已连上边缘"、本机看着一切正常,但打开那个域名是 404——因为"域名 → 本地端口"这条路由在 Cloudflare **云端**,不在本机。`npm run ctl -- tunnel check` 会把你还没做的部分列出来,而且把"已注册到边缘"和"域名真的能应答"**分开报**,因为那是两件不同的事实。修它**本机一个字都不用改**:把那条 route 补上,立刻就通。
 
 代码和文档里没有任何人的真实域名,值全部来自你自己的 `.env`。`TUNNEL_TOKEN` 和路径密钥同级,是一份完整凭据——它永远不会被打印,`ctl` 会遮住它。
 

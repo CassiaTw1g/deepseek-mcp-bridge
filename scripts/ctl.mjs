@@ -695,8 +695,9 @@ async function cmdTunnel() {
     // rather than let them discover it in ChatGPT.
     console.log("");
     console.log("⚠️  固定隧道还差一步**在 Cloudflare 那边**的配置 —— 本机看不出来它做没做:");
-    console.log(`     Zero Trust → Networks → Tunnels → 这条隧道 → Public Hostname`);
-    console.log(`     加一条:域名 ${namedHostname(env)},Service 选 HTTP、URL 填 localhost:${port}`);
+    console.log(`     Networking → Tunnels → 这条隧道 → Routes(路由)`);
+    console.log(`     → Add route → Published application(已发布的应用)`);
+    console.log(`     加一条:域名 ${namedHostname(env)},Service 选 HTTP、URL 填 http://localhost:${port}`);
     console.log("     少了它,隧道一切正常但打开那个域名会 404。");
     console.log("     验证:`npm run ctl -- tunnel check`");
   }
@@ -786,8 +787,9 @@ async function cmdTunnelCheck() {
   console.log("配置齐全,可以 `npm run tunnel`。");
   console.log("");
   console.log("⚠️  下面这条本机验证不了,得你自己在 Cloudflare 控制台确认:");
-  console.log(`     Zero Trust → Networks → Tunnels → 这条隧道 → Public Hostname`);
-  console.log(`     有一条:域名 ${namedHostname(env)} → Service HTTP → localhost:${env.PORT ?? "8787"}`);
+  console.log(`     Networking → Tunnels → 这条隧道 → Routes(路由) → Add route`);
+  console.log(`     → Published application(已发布的应用)`);
+  console.log(`     有一条:域名 ${namedHostname(env)} → Service HTTP → http://localhost:${env.PORT ?? "8787"}`);
   console.log("     少了它,隧道显示已连上,但打开域名是 404。");
 
   const url = configuredTunnelUrl(env);
@@ -1605,8 +1607,9 @@ async function cmdTunnelNamed(args) {
   console.log("这个域名必须已经托管在 Cloudflare 上(NS 指向 Cloudflare),否则后面那步加不了。");
   console.log("");
   console.log("接下来需要一个隧道 token,在 Cloudflare 控制台拿:");
-  console.log("  Zero Trust → Networks → Tunnels → Create a tunnel → 选 Cloudflared");
-  console.log("  创建后页面上会给一串很长的 token,复制它。");
+  console.log("  Networking → Tunnels → Create a tunnel");
+  console.log("  (老的 Zero Trust → Networks → Connectors 菜单现在跳到这儿,是同一个页面)");
+  console.log("  起个名字 → 下一步 → 页面上会给一串很长的 token,复制它。");
   console.log("  (如果这条隧道已经建好了:点进去 → Configure → 也能看到 token)");
   console.log("");
 
@@ -1630,11 +1633,12 @@ async function cmdTunnelNamed(args) {
   console.log("═".repeat(62));
   console.log("还剩一步,这一步只能在 Cloudflare 网页上做 —— 本机做不了:");
   console.log("");
-  console.log(`  Zero Trust → Networks → Tunnels → 选中这条隧道 → Public Hostname → Add`);
+  console.log(`  Networking → Tunnels → 点进这条隧道 → Routes(路由) → Add route`);
+  console.log(`    → Published application(已发布的应用)`);
   console.log(`    域名(Subdomain) : ${host.split(".")[0]}`);
   console.log(`    域(Domain)       : ${host.split(".").slice(1).join(".")}`);
   console.log(`    Service 类型     : HTTP`);
-  console.log(`    Service URL      : localhost:${parseEnvFile().PORT ?? "8787"}`);
+  console.log(`    Service URL      : http://localhost:${parseEnvFile().PORT ?? "8787"}`);
   console.log("");
   console.log("  漏了这一步:隧道会显示「已连上边缘」,但打开域名是 404。");
   console.log("═".repeat(62));

@@ -330,19 +330,26 @@ Start with the first row. Move on only if an occasional rebuild still bothers yo
 
 The quick tunnel is the default because it needs no setup. If you have a domain whose NS already points at Cloudflare, you can have a URL that survives restarts, reboots and `restart` alike — so the connector is built once and never touched again.
 
+Two of the three steps happen in Cloudflare's dashboard and only you can do them. **Create the tunnel** at `Networking → Tunnels → Create a tunnel` (older guides say `Zero Trust → Networks → Connectors`; that menu redirects to the same page), then **add the route** under that tunnel's `Routes` tab:
+
+```
+Networking → Tunnels → your tunnel → Routes → Add route
+  → Published application
+  Subdomain    : mcp
+  Domain       : your domain
+  Service type : HTTP
+  Service URL  : http://localhost:8787
+```
+
+Cloudflare creates the DNS record and the certificate for you — do not add one by hand. Then copy the long token the page shows you and come back here:
+
 ```bash
 npm run ctl -- tunnel named mcp.example.com
 ```
 
-It asks for the tunnel token (paste it — do not retype it into a file by hand), writes your `.env` for you, and then tells you the one step that only you can do:
+It asks for the tunnel token (paste it — do not retype it into a file by hand) and writes your `.env` for you. On Windows, `windows/11-固定域名.bat` is the same thing from a double-click: it prints the dashboard steps, asks for the hostname and the token, and offers to switch the tunnel over once you confirm the route is saved.
 
-```
-Zero Trust → Networks → Tunnels → your tunnel → Public Hostname → Add
-  Service type : HTTP
-  Service URL  : localhost:8787
-```
-
-⚠️ **Skipping that step is the trap.** The tunnel will report `connected to the edge`, everything local looks healthy, and the domain returns 404 — because the "hostname → local port" route lives in Cloudflare's cloud, not on this machine. `npm run ctl -- tunnel check` lists what you have not done yet, and reports "registered with the edge" and "the domain actually answers" **separately**, because they are different facts.
+⚠️ **Skipping the route step is the trap.** The tunnel will report `connected to the edge`, everything local looks healthy, and the domain returns 404 — because the "hostname → local port" route lives in Cloudflare's cloud, not on this machine. `npm run ctl -- tunnel check` lists what you have not done yet, and reports "registered with the edge" and "the domain actually answers" **separately**, because they are different facts. Nothing on your machine has to change to fix it: add the route and it starts working.
 
 Nothing real is hardcoded here: the code and docs carry no one's domain, and every value comes from your own `.env`. `TUNNEL_TOKEN` is a credential on the same footing as the path secret — it is never printed, and `ctl` masks it.
 
