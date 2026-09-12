@@ -22,6 +22,8 @@ npm run ctl -- secret     # writes MCP_PATH_SECRET into .env
 
 You need Node.js >= 24. There is no build step — the runtime strips TypeScript types natively.
 
+`npm run setup` does all of the above interactively if you would rather answer questions than edit `.env` — it also proves an API key against the endpoint before writing it. It runs on a **bare clone, before `npm install`**, which is a constraint on the code rather than a convenience: `scripts/setup.mjs` imports nothing outside `node:` builtins, so it cannot reach into `src/` (the harness pulls in the MCP SDK, which is not installed yet). If you add a question, keep that property, and note that `npm run test:setup` asserts the Claude Code search paths in `setup.mjs` have not drifted from the ones in `src/harness/claude-code.ts`.
+
 To work on the server without a DeepSeek key or a tunnel:
 
 ```bash
@@ -42,7 +44,8 @@ npm run smoke
 Run the same checks CI does:
 
 ```bash
-npm test    # typecheck + selftest:memory
+npm test    # typecheck + test:loop + test:sandbox + test:approvals + test:guard
+            # + test:jobs + test:setup + selftest:memory
 ```
 
 Both must pass. A PR that does not typecheck will not be reviewed.

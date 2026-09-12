@@ -89,7 +89,7 @@ Read that twice. The tiers differ by orders of magnitude:
 
 Before exposing the bridge:
 
-1. Use a **dedicated** DeepSeek API key. Do not reuse a key other tools depend on.
+1. Use a **dedicated** DeepSeek API key. Do not reuse a key other tools depend on. `npm run setup` asks for it with the terminal echo off and writes it straight to `.env`; that masking is a screen-level courtesy — it keeps the key out of a shoulder-surfer's view and out of `npm run`'s own output, and out of the process list, which a command-line argument would not be. It is not a boundary. The key is the one credential the wizard handles, and the only place it goes is `.env`.
 2. Set a **spend cap** on that key in the DeepSeek console. This is the last line of defence.
 3. Keep `HOST=127.0.0.1`. Do not set `0.0.0.0`.
 4. Rotate `MCP_PATH_SECRET` with `npm run ctl -- rotate` if the URL may have leaked — it restarts the server, keeps the tunnel (so the hostname does not change) and puts the new URL on your clipboard. Then update the connector URL.
