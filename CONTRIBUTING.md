@@ -13,8 +13,8 @@ If you are unsure whether something is in scope, open an issue first. It is chea
 ## Development setup
 
 ```bash
-git clone https://github.com/CassiaTw1g/deepseek-mcp-bridge.git
-cd deepseek-mcp-bridge
+git clone https://github.com/CassiaTw1g/modelbridge.git
+cd modelbridge
 npm install
 cp .env.example .env
 npm run ctl -- secret     # writes MCP_PATH_SECRET into .env

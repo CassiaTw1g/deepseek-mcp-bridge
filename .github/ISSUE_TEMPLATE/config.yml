@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/CassiaTw1g/deepseek-mcp-bridge/security/advisories/new
+    url: https://github.com/CassiaTw1g/modelbridge/security/advisories/new
     about: Report a vulnerability privately. Do not open a public issue.
   - name: Question / usage help
-    url: https://github.com/CassiaTw1g/deepseek-mcp-bridge/discussions
+    url: https://github.com/CassiaTw1g/modelbridge/discussions
     about: Ask questions and get help from the community.

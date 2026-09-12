@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title DeepSeek Bridge - LOGS
+title ModelBridge - LOGS
 cd /d "%~dp0.."
 
 echo Latest log lines. Double-click this file again to refresh.

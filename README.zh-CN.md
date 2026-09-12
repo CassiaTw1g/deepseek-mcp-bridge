@@ -1,6 +1,8 @@
-# deepseek-mcp-bridge
+# ModelBridge
 
-把 **DeepSeek** 包装成一个 MCP 工具,供 ChatGPT connector(以及任何 MCP 客户端)调用;也可以让它成为**能动手的子代理**——读文件、跑命令、多步迭代直到把任务做完。
+给 ChatGPT connector(以及任何 MCP 客户端)配一个**能真正干活的子代理**——读文件、跑命令、多步迭代直到把任务做完。
+
+它出厂时指向 **DeepSeek**,那只是便宜好用的默认值,不是这个项目的重点。设计本身与模型无关:子代理的脑子是你在 `DEEPSEEK_BASE_URL` 里填的那个 Anthropic 兼容端点,外面那层 harness 也是可替换的部件。名字就是从这来的。
 
 [English](README.md) · [更新日志](CHANGELOG.md) · [贡献指南](CONTRIBUTING.md) · [安全策略](SECURITY.md)
 
@@ -100,8 +102,8 @@ ChatGPT (Sol) ──HTTPS──▶ Cloudflare 边缘 ──隧道──▶ 本�
 ## 快速开始
 
 ```bash
-git clone https://github.com/CassiaTw1g/deepseek-mcp-bridge.git
-cd deepseek-mcp-bridge
+git clone https://github.com/CassiaTw1g/modelbridge.git
+cd modelbridge
 npm install
 cp .env.example .env
 ```
@@ -193,6 +195,11 @@ npm run tunnel    # cloudflared 快速隧道;打印公网 URL 和完整的 MCP �
 | `MCP_PATH_SECRET` | — | **必填**,至少 16 字符。能力路径段。`npm run ctl -- secret` 生成 32 字节 hex。 |
 | `PORT` | `8787` | 本地监听端口。 |
 | `HOST` | `127.0.0.1` | 监听地址。**保持回环**——隧道跑在同一台机器上,把端口暴露到局域网没有任何好处。 |
+| `TUNNEL_MODE` | `quick` | `quick` = Cloudflare 快速隧道:零配置,但**每次启动都换一个随机 `*.trycloudflare.com` 域名**,所以 ChatGPT connector 得重建(而且域名被 Cloudflare 回收后会变成 `Unauthorized: Tunnel not found`)。`named` = 在**你自己的域名**上固定下来,见[用自己的域名固定下来](#用自己的域名固定下来)。 |
+| `TUNNEL_HOSTNAME` | — | named 模式必填。你的公网主机名,例如 `mcp.example.com`——不带 `https://`,不带路径。它必须已经在 Cloudflare 上,否则控制台配不了路由。 |
+| `TUNNEL_TOKEN` | — | named 模式。Cloudflare 控制台为这条隧道签发的凭据。**是一份完整凭据**,与 `MCP_PATH_SECRET` 同级:`ctl` 会遮住它,永不打印、永不提交。别手抄进文件——`npm run ctl -- tunnel named <主机名>` 会问你要并替你写。 |
+| `TUNNEL_NAME` | — | named 模式,用来代替 `TUNNEL_TOKEN`:你用 `cloudflared` CLI 创建的隧道名。走这条路时 cloudflared 读它自己的配置和凭据,所以路由规则在**那份配置**里,不在 `TUNNEL_HOSTNAME`——两边要保持一致。 |
+| `TUNNEL_PROTOCOL` | *(自动探测)* | cloudflared 连边缘用的传输:`quic`(UDP 7844)或 `http2`(TCP 7844)。留空让它自己探测。**在代理或 TUN 模式梯子后面**请钉成 `quic`——TUN 会吞掉出站 TCP/7844,而 UDP 直通。选错是安静地失败:进程活着、`ctl status` 报"running",但外面够不着,日志反复刷 `TLS handshake with edge error: EOF`。两种隧道模式都适用。 |
 | `RATE_LIMIT_PER_MINUTE` | `60` | 滑动窗口,URL 泄漏时限制爆炸半径。**全局一个桶,不是每 IP 的**——服务监听在回环,连进来的只有隧道,所以 `X-Forwarded-For` 是调用方随手写的;信它等于把限流变成"每个假 IP N 次"。只计 `tools/call`:一次轮询可能算三次请求(initialize / tools/list / call),把握手算进去的话,长任务会被自己的轮询打成 429。 |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | OpenAI 兼容端点。 |
 | `DEEPSEEK_MODEL` | `deepseek-flash` | 模型 ID。 |
@@ -210,7 +217,7 @@ npm run tunnel    # cloudflared 快速隧道;打印公网 URL 和完整的 MCP �
 | `BRIDGE_JOB_TIMEOUT_MS` | `1800000` | 墙钟上限(30 分钟)。超时会连同整个子进程树一起结束。`server.ts` 会把注册表自己那道硬墙设成这里 +1 分钟,保证 runner 的超时永远先响——反过来硬墙赢了的话,它会把中止报成一句*已取消*,看不出原因。 |
 | `BRIDGE_APPROVAL_TIMEOUT_MS` | `300000` | 一条命令等人工处理多久(5 分钟)。**超时即拒绝。** |
 | `BRIDGE_APPROVE_ALLOW` | 见 `DEFAULT_ALLOW` | 逗号分隔的预放行**命令名**——`node` `npm` `git` `dir` `type` 等,加上 PowerShell 的只读 cmdlet。**只比对第一个词**,约束的是"哪个程序",不是它的参数。名单外的一律暂停等人工。注意它只管**命令**:工作区外的文件读写、以及任何联网工具,无论名单里有什么,都必须人工批准。 |
-| `BRIDGE_CC_APPROVAL` | 开 | 设为 `off` 会整个跳过审批队列——之后所有命令无人值守直接执行。只给 `npm run accept` 用。 |
+| `BRIDGE_CC_APPROVAL` | 开 | 设为 `off` 会整个跳过审批队列。⚠️ 它拿掉的比"不再询问"更多:子进程 `approval-mcp.ts` **根本不会启动**,命令允许名单、链式命令护栏、文件工具的工作区边界**一起消失**。⚠️ 它**不随重启复位**,所以不适合当日常开关——要临时放行请用 `npm run auto:on`,下次重启会自动收回。保持注释状态;只有 `npm run accept` 会显式覆盖它。 |
 | `BRIDGE_CLAUDE_BIN` | `PATH` 上的 `claude` | Claude Code 可执行文件路径。 |
 | `BRIDGE_ANTHROPIC_BASE_URL` | `$DEEPSEEK_BASE_URL/anthropic` | harness 把请求发到哪里。 |
 | `BRIDGE_STATE_DIR` | `<项目目录>/.state` | 任务快照、审批队列、审计日志的位置。 |
@@ -225,14 +232,21 @@ npm run stop       # 停止服务和隧道
 npm run restart    # 重启服务(会一并停掉隧道,需重新 tunnel)
 npm run status     # 启用状态、PID、本地与公网端点
 npm run logs       # 最近 40 行日志
+npm run url        # 把完整 connector 地址复制到剪贴板并打印出来
 npm run tunnel     # 启动 Cloudflare 隧道并打印公网 URL
 npm run untunnel   # 只停隧道
+npm run auto       # 查看当前审批模式
+npm run auto:on    # 完全放行(详见"安全模型")
+npm run auto:off   # 恢复"需要批准"
 npm run enable     # 清除 disabled 标志
 npm run disable    # 停止一切并设置 disabled 标志
 npm run uninstall  # 停止并清除本地状态(保留项目目录)
 ```
 
 `npm run start --foreground` 前台运行,便于调试。
+
+重建 ChatGPT connector 时用 `npm run url`:它打印 `https://<域名>/mcp/<密钥>`,并把同一串
+放进剪贴板,不用再从 `npm run status --show` 的输出里用鼠标划选那一长串密钥。
 
 ### 轮换路径密钥
 
@@ -269,10 +283,32 @@ npm run ctl -- reload
 | 做法 | 代价 | 效果 |
 |---|---|---|
 | **什么都不做** | 零 | 日常通常够了。`reload` 不动隧道,`ctl` 也不再打印密钥,所以正常使用下 URL 不会变。只有你**主动轮换密钥**时才需要重建一次 connector。 |
-| **换成域名固定的隧道** | 装一个软件、注册一个账号 | URL 的域名部分**永久不变**。最省事的是 [Tailscale Funnel](https://tailscale.com/kb/1223/funnel):个人使用免费,给你 `https://<机器名>.<你的网络>.ts.net`,**不用买域名**。*本条尚未在本桥接上实测。* |
-| Cloudflare 命名隧道 | 必须**自己拥有一个域名**,并把 DNS 托管到 Cloudflare | 效果同上,域名是你自己的。 |
+| **换成域名固定的隧道** | 必须**自己拥有一个域名**,且 NS 已指向 Cloudflare | URL 的域名部分**永久不变**,本桥接已内置,见下。 |
+| **第三方固定域名隧道** | 装一个软件、注册一个账号 | 效果同上。[Tailscale Funnel](https://tailscale.com/kb/1223/funnel) 不用买域名:个人使用免费,给你 `https://<机器名>.<你的网络>.ts.net`。*本条尚未在本桥接上实测。* |
 
-先从第一行开始。只有当"偶尔重建一次"仍然让你难受时,再上 Tailscale Funnel。
+先从第一行开始。只有当"偶尔重建一次"仍然让你难受时,再往下走。
+
+#### 用自己的域名固定下来
+
+快速隧道之所以是默认,是因为它零配置。如果你有一个域名、且它的 NS 已经指向 Cloudflare,就能拿到一个**重启、重开机、`restart` 之后都不变**的地址——connector 建一次,以后再也不用碰。
+
+```bash
+npm run ctl -- tunnel named mcp.example.com
+```
+
+它会问你要隧道 token(粘进去就行,**别手抄进文件**),替你写好 `.env`,然后告诉你那件只有你能做的事:
+
+```
+Zero Trust → Networks → Tunnels → 这条隧道 → Public Hostname → Add
+  Service 类型 : HTTP
+  Service URL  : localhost:8787
+```
+
+⚠️ **漏掉这一步就是那个坑。** 漏了的话,隧道会报"已连上边缘"、本机看着一切正常,但打开那个域名是 404——因为"域名 → 本地端口"这条路由在 Cloudflare **云端**,不在本机。`npm run ctl -- tunnel check` 会把你还没做的部分列出来,而且把"已注册到边缘"和"域名真的能应答"**分开报**,因为那是两件不同的事实。
+
+代码和文档里没有任何人的真实域名,值全部来自你自己的 `.env`。`TUNNEL_TOKEN` 和路径密钥同级,是一份完整凭据——它永远不会被打印,`ctl` 会遮住它。
+
+> **不要用 ngrok 免费版。** 它会插一个浏览器警告页,需要 `ngrok-skip-browser-warning` 请求头才能跳过,而 ChatGPT connector 无法自定义请求头——连接会直接被掐断。
 
 ### agent 任务与审批命令
 
@@ -413,6 +449,35 @@ B 是承重的那一根。该套件刻意关掉了审批,所以它不进 `npm te
 - **清空 `DEEPSEEK_ALLOWED_ROOTS` 并重启即可退回第一层。** 这是受支持的配置,也是推荐的起步方式:先只读跑一段时间,确认 URL 没泄漏,再考虑打开。
 
 **这不是安全边界,是人的观察窗口。** 真正的边界只有沙盒或虚拟机——任务跑起来时人要在电脑旁。**不要把开了 agent 能力的实例部署成公网服务。**
+
+### 临时全部放行(`npm run auto:on`)
+
+盯着一批任务跑的时候,一条条批命令很烦。这个开关把审批整个关掉:
+
+```bash
+npm run auto        # 看现在是哪种模式
+npm run auto:on     # 完全放行
+npm run auto:off    # 恢复"需要批准"
+```
+
+**它关掉的比你以为的多。** 不是"命令不再逐条问",而是 `approval-mcp.ts` 这个子进程**根本不会被启动**,于是挂在它上面的闸门一起消失:
+
+| 闸门 | 放行模式下 |
+|---|---|
+| 命令允许名单 | 失效 |
+| 链式命令护栏(`;` `&&` `\|\|` `\|`、重定向) | 失效 |
+| 文件工具的工作区边界 | 失效 |
+| `audit.log` 里的逐条审批记录 | 不再产生 |
+
+**仍然有效的**:`DEEPSEEK_ALLOWED_ROOTS` 照旧决定**哪些目录能作为工作区被打开**。放行模式放开的是"打开之后能在里面做什么",不是"能打开哪些目录"。
+
+**重启会自动收回。** 开关写在 `.state/auto-approve` 这个标志文件里(不是 `.env`),服务每次启动都会把它删掉。所以 `reload` / `restart` / 重开电脑之后一律回到"需要批准"。这是刻意的:放行是"我现在盯着它跑",不是"我以后都不管了"。`reload`、`rotate`、`allow` 都会重启服务,因此也会收回它——这三条命令都会提前告诉你。
+
+**开启不需要重启**,从下一个任务起生效(判据是每个任务现读的)。
+
+> `.env` 里的 `BRIDGE_CC_APPROVAL=off` 是另一条通路,**不随重启复位**,保留给 `npm run accept` 用。如果两条都开了,`auto off` 只会关掉标志文件那条,`ctl status` 会明确告诉你 `.env` 那条还在生效。
+
+**审计上的诚实说明:** 放行模式下不再写 `approval_requested` / `approval_auto` 这类逐条记录——写它们的进程根本没起来。留下的只有模式变更那几行(`auto_approve_on` / `auto_approve_off` / `auto_approve_cleared`),以及 `.state/jobs/<id>.json` 里 harness 自己记的**工具调用轨迹**(每次调用一条,上限 400 条,`npm run ctl -- jobs <id> --trace` 可查)。**记录不等于拦截**——那是事后回看用的,不是护栏。
 
 上报漏洞请见 [SECURITY.md](SECURITY.md)。
 

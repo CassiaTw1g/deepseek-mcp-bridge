@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title DeepSeek Bridge - ROTATE SECRET
+title ModelBridge - ROTATE SECRET
 cd /d "%~dp0.."
 
 echo ============================================================

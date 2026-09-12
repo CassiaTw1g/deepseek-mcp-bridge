@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { STATE_DIR, type JobContext, type JobInput, type JobResult, type JobRunner } from "../agent/jobs.ts";
-import { DEFAULT_ALLOW, listPending } from "../agent/approvals.ts";
+import { DEFAULT_ALLOW, autoApproveOn, listPending } from "../agent/approvals.ts";
 
 /**
  * Runs a task by spawning Claude Code in headless mode, pointed at DeepSeek.
@@ -288,7 +288,13 @@ export async function runClaudeCode(
   const timeoutMs = options.timeoutMs ?? 30 * 60_000;
 
   const stateDir = options.stateDir ?? STATE_DIR;
-  const approvalOn = options.approval ?? process.env.BRIDGE_CC_APPROVAL !== "off";
+  // Deliberately not `process.env.BRIDGE_CC_APPROVAL !== "off"` any more. That
+  // value is frozen at boot by `dotenv/config`, so the only way to reach
+  // unattended mode was to edit `.env` and restart — which is how a security
+  // setting ends up toggled by hand-editing and then forgotten. `autoApproveOn`
+  // re-reads the flag file per job, so `npm run auto:on` takes effect on the
+  // *next* job with no restart, and the restart is what turns it back off.
+  const approvalOn = options.approval ?? !autoApproveOn(stateDir);
   const approvalAllow = options.approvalAllow ?? DEFAULT_ALLOW;
   const approvalTimeoutMs =
     options.approvalTimeoutMs ?? Number(process.env.BRIDGE_APPROVAL_TIMEOUT_MS ?? 5 * 60_000);
@@ -296,7 +302,7 @@ export async function runClaudeCode(
   // Bridge-scoped, not job-scoped: config isolation is about keeping the child
   // off the operator's account, and putting it in the workspace would litter
   // every job's output directory with a config tree.
-  const configDir = options.configDir ?? join(tmpdir(), "deepseek-bridge-claude-config");
+  const configDir = options.configDir ?? join(tmpdir(), "modelbridge-claude-config");
   const env = buildEnv(configDir);
 
   const args = [

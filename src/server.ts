@@ -1,8 +1,11 @@
 import "dotenv/config";
+import { existsSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import express from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpServer } from "./mcp.ts";
-import { createRegistry } from "./agent/jobs.ts";
+import { STATE_DIR, createRegistry } from "./agent/jobs.ts";
+import { AUTO_APPROVE_FLAG, auditEvent } from "./agent/approvals.ts";
 import { createClaudeCodeRunner } from "./harness/claude-code.ts";
 import { createPolicy, parseRoots } from "./sandbox.ts";
 
@@ -37,6 +40,36 @@ if (PATH_SECRET.length < 16) {
 }
 
 const MCP_PATH = `/mcp/${PATH_SECRET}`;
+
+// ---------------------------------------------------------------------------
+// Unattended mode does not survive a restart
+// ---------------------------------------------------------------------------
+//
+// `npm run auto:on` writes a file rather than editing `.env`, which is what
+// makes it take effect on the next job without a restart — but nothing else
+// would ever turn it back off, so an operator who flipped it on for one batch
+// and walked away would leave the machine open indefinitely.
+//
+// The clearing lives *here*, not in `ctl`: `ctl` is one way to start this
+// process and `node src/server.ts` is another, and a safety default that the
+// second path skips is not a default. Every boot — reload, restart, reboot —
+// lands back in "needs approval".
+const autoApproveFlagFile = join(STATE_DIR, AUTO_APPROVE_FLAG);
+if (existsSync(autoApproveFlagFile)) {
+  rmSync(autoApproveFlagFile, { force: true });
+  auditEvent(STATE_DIR, { type: "auto_approve_cleared", reason: "服务启动,自动收回完全放行。" });
+  console.log("检测到「完全放行」标志 —— 已清除,本次启动恢复为需要批准。");
+}
+
+// The env var outranks the file, so clearing the file above would be theatre if
+// someone had also set this by hand. Say so loudly instead of letting them
+// believe the restart protected them.
+if (process.env.BRIDGE_CC_APPROVAL === "off") {
+  console.warn(
+    "⚠️  BRIDGE_CC_APPROVAL=off 仍在 .env 里 —— 完全放行依然生效,\n" +
+      "    上面那次「自动收回」对它无效。要真正恢复审批,请从 .env 删掉这一行并重启。",
+  );
+}
 
 const hits = new Map<string, number[]>();
 
@@ -177,7 +210,7 @@ app.use("/mcp", (_req, res) => {
 });
 
 const httpServer = app.listen(PORT, HOST, () => {
-  console.log(`deepseek-bridge listening on http://${HOST}:${PORT}`);
+  console.log(`modelbridge listening on http://${HOST}:${PORT}`);
   // Never the whole path. `ctl` pipes this stdout into `.state/server.log`, and
   // `ctl logs` prints the tail of that file — a channel that has leaked once
   // already, and one whose output ends up pasted into troubleshooting threads.

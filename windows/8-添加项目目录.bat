@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title DeepSeek Bridge - ALLOW A PROJECT
+title ModelBridge - ALLOW A PROJECT
 cd /d "%~dp0.."
 
 echo ============================================================

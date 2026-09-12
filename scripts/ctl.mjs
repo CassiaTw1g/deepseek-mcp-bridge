@@ -1,17 +1,19 @@
 #!/usr/bin/env node
 /**
- * Lifecycle manager for the deepseek-bridge plugin.
+ * Lifecycle manager for the modelbridge plugin.
  *
  * start / stop / restart / reload / status / enable / disable / logs / uninstall
- * secret / rotate / tunnel / untunnel / allow / jobs / pending / approve / deny / audit
+ * secret / rotate / url / tunnel / untunnel / allow / jobs / pending / approve /
+ * deny / audit / auto
  *
- * `reload` restarts the server alone; `restart` also restarts the tunnel, which
- * changes the public URL.
+ * `reload` restarts the server alone; `restart` also restarts the tunnel. With a
+ * quick tunnel that changes the public URL; with a named one it does not.
  *
  * The server is spawned detached so it survives this shell exiting.
  */
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { createInterface } from "node:readline";
 import {
   appendFileSync,
   existsSync,
@@ -23,16 +25,28 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { decide, listPending } from "../src/agent/approvals.ts";
+import { AUTO_APPROVE_FLAG, auditEvent, decide, isApprovalOff, listPending } from "../src/agent/approvals.ts";
 import { readJobSnapshots } from "../src/agent/jobs.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const ENTRY = join(ROOT, "src", "server.ts");
 const ENV_FILE = join(ROOT, ".env");
-const STATE_DIR = join(ROOT, ".state");
+// Must resolve to the *same* directory the server will use, or the auto-approve
+// flag is written somewhere nothing reads and nothing ever clears — a security
+// toggle that silently does nothing is worse than one that is missing.
+//
+// `jobs.ts` computes `process.env.BRIDGE_STATE_DIR ?? join(ROOT, ".state")`, and
+// `cmdStart` hands the child `{...process.env, ...parseEnvFile()}`, so through the
+// normal path a `.env` value beats a shell one. This mirrors that spread exactly:
+// `.env` first, then the ambient variable, then the default. `parseEnvFile` is a
+// hoisted declaration and `ENV_FILE` is initialised on the line above, so calling
+// it here is safe.
+const STATE_DIR =
+  parseEnvFile().BRIDGE_STATE_DIR || process.env.BRIDGE_STATE_DIR || join(ROOT, ".state");
 const PID_FILE = join(STATE_DIR, "server.pid");
 const LOG_FILE = join(STATE_DIR, "server.log");
 const DISABLED_FLAG = join(STATE_DIR, "disabled");
+const AUTO_APPROVE_FILE = join(STATE_DIR, AUTO_APPROVE_FLAG);
 const TUNNEL_PID_FILE = join(STATE_DIR, "tunnel.pid");
 const TUNNEL_LOG_FILE = join(STATE_DIR, "tunnel.log");
 
@@ -95,6 +109,83 @@ function findTunnelUrl() {
   return m ? m[0] : null;
 }
 
+// --- 隧道模式 ---------------------------------------------------------------
+//
+// Two ways to get a public hostname, and they differ in one way that shapes the
+// whole rest of this file:
+//
+//   quick  a throwaway `*.trycloudflare.com` name, discovered by *scraping it
+//          out of cloudflared's log* after the fact. New name on every start.
+//   named  a hostname the operator already owns, configured in `.env`. There is
+//          nothing to discover — the address is known before the process starts.
+//
+// So named mode must not run through the "wait for a URL to appear in the log"
+// path: a healthy named tunnel never prints a trycloudflare URL, and the timer
+// would expire and `exit(1)` on a tunnel that is working perfectly.
+//
+// Default is quick. Nothing here names anybody's domain — `TUNNEL_HOSTNAME` is
+// the operator's own value, read from their own `.env`.
+
+function tunnelMode(env) {
+  return (env.TUNNEL_MODE ?? "quick").trim().toLowerCase() === "named" ? "named" : "quick";
+}
+
+/** Strip a scheme or trailing slash people paste in by habit — the URL is built here. */
+function namedHostname(env) {
+  return (env.TUNNEL_HOSTNAME ?? "")
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/, "");
+}
+
+/** The configured address, or null when this isn't a usable named setup. */
+function configuredTunnelUrl(env) {
+  if (tunnelMode(env) !== "named") return null;
+  const host = namedHostname(env);
+  return host ? `https://${host}` : null;
+}
+
+/**
+ * Where the bridge is reachable from outside, whichever mode is in play.
+ *
+ * Named wins over scraped: once a hostname is configured it is *the* address, and
+ * a stale trycloudflare line left in an appended log must not shadow it.
+ */
+function publicUrl(env) {
+  return configuredTunnelUrl(env) ?? findTunnelUrl();
+}
+
+/**
+ * Whether a named tunnel has everything cloudflared needs. Returns the problems
+ * as plain sentences — `tunnel check` prints them verbatim, so "缺少 X" has to be
+ * actionable rather than a boolean.
+ */
+function namedConfigProblems(env) {
+  const problems = [];
+  if (tunnelMode(env) !== "named") return problems;
+  if (!namedHostname(env)) {
+    problems.push("TUNNEL_HOSTNAME 没填 —— 应该是你自己的域名,例如 mcp.example.com(不要带 https://)。");
+  }
+  const token = (env.TUNNEL_TOKEN ?? "").trim();
+  const name = (env.TUNNEL_NAME ?? "").trim();
+  if (!token && !name) {
+    problems.push(
+      "TUNNEL_TOKEN 和 TUNNEL_NAME 都没填 —— 二选一。\n" +
+        "     用 Cloudflare 控制台建隧道的话,把控制台给的 token 填进 TUNNEL_TOKEN。",
+    );
+  }
+  // Cloudflare's console-issued tokens are long base64-ish blobs. A short value
+  // is nearly always a tunnel UUID or name pasted into the wrong key, which
+  // would otherwise fail much later with an opaque cloudflared error.
+  if (token && token.length < 40) {
+    problems.push(
+      "TUNNEL_TOKEN 看起来不像 Cloudflare 签发的 token(通常 150 字符以上)。\n" +
+        "     如果你手上是隧道 ID 或隧道名,请填到 TUNNEL_NAME。",
+    );
+  }
+  return problems;
+}
+
 async function waitForTunnelUrl(timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -103,6 +194,66 @@ async function waitForTunnelUrl(timeoutMs) {
     await new Promise((r) => setTimeout(r, 500));
   }
   return null;
+}
+
+/**
+ * cloudflared's own view of this run: did it actually reach the edge, and how?
+ *
+ * `Registered tunnel connection` means Cloudflare acknowledged a connection ID —
+ * a real handshake, not just "a process exists". The failure that hid here for
+ * ~20 hours produced nothing but `Unable to establish connection with Cloudflare
+ * edge` lines, so "registered, and no such error since" is the honest summary.
+ */
+function tunnelState() {
+  const log = currentTunnelLog();
+  const lastReg = log.lastIndexOf("Registered tunnel connection");
+  const lastErr = log.lastIndexOf("Unable to establish connection with Cloudflare edge");
+  return {
+    up: lastReg >= 0 && lastReg > lastErr,
+    proto: /Initial protocol (\w+)/.exec(log)?.[1] ?? null,
+    url: findTunnelUrl(),
+  };
+}
+
+async function waitForTunnelReady(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const st = tunnelState();
+    if (st.up) return st;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return tunnelState();
+}
+
+/**
+ * Fetch our own public URL — out to Cloudflare's edge and back through the tunnel.
+ *
+ * ⚠️ On a machine that reaches the internet through a proxy/VPN, this CAN come
+ * back negative while the tunnel is perfectly healthy: the request has to leave
+ * through the proxy and then be routed back to us, and a TUN-style setup often
+ * breaks exactly that hairpin. Verified on 2026-09-12 — this returned nothing
+ * while an external fetcher got `{"ok":true}` off the same URL. So treat a
+ * failure as "本机回连不通,需要外部确认", never as proof the tunnel is down.
+ * Use tunnelState() for the verdict.
+ */
+async function probePublicHealth(url, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = "未尝试";
+  do {
+    try {
+      const res = await fetch(`${url}/health`, {
+        signal: AbortSignal.timeout(6000),
+        redirect: "follow",
+      });
+      if (res.ok) return { ok: true, detail: `HTTP ${res.status}` };
+      last = `HTTP ${res.status}`;
+    } catch (err) {
+      const name = err?.name ?? "";
+      last = name === "TimeoutError" || name === "AbortError" ? "超时" : (err?.message ?? String(err));
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+  } while (Date.now() < deadline);
+  return { ok: false, detail: last };
 }
 
 function isAlive(pid) {
@@ -157,8 +308,18 @@ function mask(text) {
   // lines and job results are free text: anything the sub-agent ever printed —
   // `echo $env:MCP_PATH_SECRET`, a prompt-injected file, a stack trace — lands
   // in them verbatim. So the literal value is masked too, wherever it appears.
-  const secret = process.env.MCP_PATH_SECRET || parseEnvFile().MCP_PATH_SECRET || "";
-  if (secret.length >= 8) out = out.split(secret).join("<密钥已隐藏>");
+  // Both credentials, not just the path secret. `TUNNEL_TOKEN` is the newer one
+  // and is strictly more dangerous: it is full control of a tunnel into this
+  // machine, it is handed to a *third-party binary's* command line, and any
+  // diagnostic that dumps argv (`--loglevel debug`, a crash report, a process
+  // listing) would otherwise put it straight into whatever file we printed to.
+  const env = parseEnvFile();
+  for (const key of ["MCP_PATH_SECRET", "TUNNEL_TOKEN"]) {
+    const value = process.env[key] || env[key] || "";
+    // The length floor is about false positives, not safety: a one-character
+    // value would turn every occurrence of that character into noise.
+    if (value.length >= 8) out = out.split(value).join(`<${key} 已隐藏>`);
+  }
   return out;
 }
 
@@ -267,7 +428,20 @@ function readTunnelPid() {
   return pid;
 }
 
+/**
+ * Remove the on-disk copy of the tunnel token.
+ *
+ * `namedTunnelArgs` writes it so the credential never has to appear in a command
+ * line. Nothing else would ever clean it up, and a credential copy that outlives
+ * the thing it was for is pure liability — `.env` is the one place it is meant to
+ * live, and the next `tunnel` rewrites this file from there anyway.
+ */
+function removeTunnelToken() {
+  rmSync(join(STATE_DIR, "tunnel.token"), { force: true });
+}
+
 function cmdUntunnel() {
+  removeTunnelToken();
   const pid = readTunnelPid();
   if (!pid) {
     console.log("隧道未在运行。");
@@ -299,7 +473,7 @@ async function cmdTunnel() {
 
   const existing = readTunnelPid();
   if (existing) {
-    const url = findTunnelUrl();
+    const url = publicUrl(state.env);
     console.log(`隧道已在运行,PID ${existing}`);
     if (url) console.log(`公网端点 : ${mask(`${url}/mcp/${state.env.MCP_PATH_SECRET ?? ""}`)}`);
     return;
@@ -307,53 +481,290 @@ async function cmdTunnel() {
 
   const env = { ...process.env, ...state.env };
   const port = env.PORT ?? "8787";
+  const named = tunnelMode(env) === "named";
+
+  if (named) {
+    const problems = namedConfigProblems(env);
+    if (problems.length > 0) {
+      console.error("TUNNEL_MODE=named,但配置不全:");
+      for (const p of problems) console.error(`  - ${p}`);
+      console.error("");
+      console.error("配置说明:.env.example 里 TUNNEL_MODE 那一段;也可以 `npm run ctl -- tunnel check`。");
+      process.exit(1);
+    }
+  }
+
   ensureStateDir();
   appendFileSync(TUNNEL_LOG_FILE, `\n--- tunnel ${new Date().toISOString()} ---\n`);
 
   const logFd = openSync(TUNNEL_LOG_FILE, "a");
-  // --protocol http2 is not optional: QUIC is unreliable on many CN networks,
-  // and without it the tunnel registers but never carries traffic.
-  const child = spawn(
-    resolveCloudflared(),
-    ["tunnel", "--url", `http://localhost:${port}`, "--protocol", "http2"],
-    { cwd: ROOT, env, detached: true, windowsHide: true, stdio: ["ignore", logFd, logFd] },
-  );
+  let args;
+
+  if (named) {
+    // No `--url`: the route from hostname to local port lives in Cloudflare's
+    // remote config (the Public Hostname you set in the dashboard), not here.
+    // Passing `--url` as well would fight that rather than help it.
+    //
+    // `--protocol` is honoured here (it is a hidden flag — see namedTunnelArgs),
+    // but only when the operator set it. Left alone, `tunnel run` runs its own
+    // connectivity pre-check and prefers QUIC/UDP, which is what survives a
+    // TUN-style VPN — so the default is already the right answer for most people.
+    args = namedTunnelArgs(env);
+  } else {
+    // Transport protocol. Default `auto` = don't pass --protocol at all, which makes
+    // cloudflared run its own connectivity pre-check and use whichever of QUIC
+    // (UDP/7844) or HTTP/2 (TCP/7844) actually works on this machine right now.
+    //
+    // ⚠️ Do NOT hardcode http2 again. With a Clash-style VPN in TUN mode (which
+    // ChatGPT itself needs), outbound TCP/7844 gets swallowed by the proxy and dies
+    // with `TLS handshake with edge error: EOF`, while UDP/7844 sails straight
+    // through — cloudflared's own pre-check reports exactly that:
+    //   UDP Connectivity  PASS   QUIC connection successful
+    //   TCP Connectivity  FAIL   HTTP/2 connection is blocked or unreachable
+    // Forcing http2 there means the tunnel can never connect at all. That is what
+    // silently broke this tunnel for ~20 hours on 2026-09-12.
+    //
+    // Override in .env when auto picks wrong: TUNNEL_PROTOCOL=http2 | quic
+    const protocol = (env.TUNNEL_PROTOCOL ?? "auto").trim().toLowerCase();
+    args = ["tunnel", "--url", `http://localhost:${port}`];
+    if (protocol === "http2" || protocol === "quic") args.push("--protocol", protocol);
+  }
+
+  const child = spawn(resolveCloudflared(), args, {
+    cwd: ROOT,
+    env,
+    detached: true,
+    windowsHide: true,
+    stdio: ["ignore", logFd, logFd],
+  });
   child.unref();
   writeFileSync(TUNNEL_PID_FILE, String(child.pid));
 
-  console.log(`隧道启动中(PID ${child.pid}),等待分配公网地址…`);
-  const url = await waitForTunnelUrl(30_000);
-  if (!url) {
-    console.error(`30 秒内没拿到公网地址。看日志:${TUNNEL_LOG_FILE}`);
-    process.exit(1);
+  // The one structural difference between the two modes, and the reason named
+  // mode cannot reuse the quick path: a quick tunnel's address does not exist
+  // until cloudflared invents one and prints it, so it has to be waited for and
+  // scraped. A named tunnel's address was decided by the operator before this
+  // process started. Waiting for a `*.trycloudflare.com` line that will never
+  // come would time out and `exit(1)` on a tunnel that is working perfectly.
+  let url;
+  if (named) {
+    url = configuredTunnelUrl(env);
+    console.log(`隧道启动中(PID ${child.pid}),固定地址 ${url}(不用等分配)`);
+  } else {
+    console.log(`隧道启动中(PID ${child.pid}),等待分配公网地址…`);
+    url = await waitForTunnelUrl(30_000);
+    if (!url) {
+      console.error(`30 秒内没拿到公网地址。看日志:${TUNNEL_LOG_FILE}`);
+      process.exit(1);
+    }
   }
 
   const full = `${url}/mcp/${env.MCP_PATH_SECRET ?? ""}`;
   console.log("");
   console.log(`公网端点 : ${mask(full)}`);
   console.log(`健康检查 : ${url}/health`);
+
+  // 拿到 URL 不等于能用 —— 等 cloudflared 真的注册到边缘。
+  process.stdout.write("隧道状态 : 等待 cloudflared 注册到 Cloudflare 边缘");
+  const st = await waitForTunnelReady(30_000);
+  console.log(st.up ? ` … 已注册 (传输 ${st.proto ?? "?"})` : " … 失败");
+  console.log("");
+
+  if (!st.up) {
+    console.error("⚠️  隧道进程起来了,但**一次都没能连上 Cloudflare 边缘**。");
+    console.error("    ChatGPT 现在连上去只会失败,别把上面这个 URL 填进去。");
+    console.error("");
+    if (named) {
+      console.error("    固定隧道连不上,通常是这几件事:");
+      console.error("      1. token 复制不完整(少一个字符就整个不通),重新从控制台复制一次");
+      console.error("      2. 这条隧道已经在别处跑着 —— 同一个 token 只能有一份在跑");
+      console.error("      3. VPN/TUN 抢走出站流量,试 TUNNEL_MODE=quick 对照一下");
+    } else {
+      console.error("    最常见的原因是 VPN/TUN 抢走了出站流量。在 .env 里指定协议再试:");
+      console.error("      TUNNEL_PROTOCOL=auto    让 cloudflared 自己探测(默认)");
+      console.error("      TUNNEL_PROTOCOL=quic    开着 TUN 时通常选这个(UDP 7844)");
+      console.error("      TUNNEL_PROTOCOL=http2   直连、没开 TUN 时(TCP 7844)");
+    }
+    console.error("    改完执行 `npm run ctl -- untunnel && npm run ctl -- tunnel`。");
+    console.error(`    也可以直接看日志里 cloudflared 自己的自检:${TUNNEL_LOG_FILE}`);
+    process.exit(1);
+  }
+
+  // 注册成功 = 隧道这头通了。下面这条只是参考,本机走梯子时常常是假警报。
+  process.stdout.write("本机回连 : ");
+  const probe = await probePublicHealth(url, 10_000);
+  if (probe.ok) {
+    console.log(`通 (${probe.detail})`);
+  } else {
+    console.log(`不通 (${probe.detail}) —— 多半是本机经梯子绕不回来,不代表外面连不上`);
+  }
   console.log("");
   console.log("填进 ChatGPT 网页版 → Settings → Plugins → MCP → Add server:");
   console.log("  类型选 Streamable HTTP,鉴权选「无鉴权 / No authentication」");
   console.log(`  URL  ${mask(full)}`);
   if (!flags.has("--show")) console.log("  (密钥默认隐藏;要打印完整 URL 加 --show)");
+
+  if (named) {
+    // The failure this mode invites: the tunnel is genuinely up, but nobody ever
+    // added the hostname on Cloudflare's side, so the domain 404s. "Registered
+    // to the edge" cannot distinguish that, so say the requirement out loud
+    // rather than let them discover it in ChatGPT.
+    console.log("");
+    console.log("⚠️  固定隧道还差一步**在 Cloudflare 那边**的配置 —— 本机看不出来它做没做:");
+    console.log(`     Zero Trust → Networks → Tunnels → 这条隧道 → Public Hostname`);
+    console.log(`     加一条:域名 ${namedHostname(env)},Service 选 HTTP、URL 填 localhost:${port}`);
+    console.log("     少了它,隧道一切正常但打开那个域名会 404。");
+    console.log("     验证:`npm run ctl -- tunnel check`");
+  }
 }
 
-function cmdStatus() {
+/**
+ * argv for a named tunnel, and where the credential lives.
+ *
+ * `--token-file` rather than `--token`: an argument is readable by any process on
+ * this machine (Task Manager's command-line column, `wmic process get
+ * commandline`) with no file permissions in the way, while a file has ACLs. The
+ * token is full control of a tunnel into this machine, so it does not belong in
+ * a command line. `.state/` is gitignored in both repositories.
+ *
+ * `TUNNEL_NAME` is the alternative for people who set the tunnel up with the
+ * cloudflared CLI instead of the dashboard: that path reads credentials and
+ * ingress rules from cloudflared's own config, so we pass nothing but the name.
+ *
+ * ⚠️ `--protocol` HERE TOO — do not drop it from this branch.
+ *
+ * It is a *hidden* flag: it appears in no help text, in any of the three
+ * positions (`cloudflared --help`, `tunnel --help`, `tunnel run --help`). Reading
+ * the help and concluding "it does not exist on `tunnel run`" is wrong, and was
+ * wrong here once. The check that actually settles it is a control: an
+ * undefined flag makes cloudflared refuse to parse —
+ *   `--this-flag-does-not-exist` → "Incorrect Usage: flag provided but not defined"
+ * — while `tunnel run --protocol quic` parses fine and gets as far as complaining
+ * about a missing tunnel ID. Both flag orders work; this one puts it before the
+ * subcommand, which is the safer position against a future reorganisation.
+ *
+ * Why it matters: an operator who had to force `quic` for a quick tunnel (i.e.
+ * anyone behind a TUN-mode VPN — see the long note in `cmdTunnel`) has exactly
+ * the same problem on a named one, and would otherwise have no way to say so.
+ * Passing it only when explicitly configured keeps the default as cloudflared's
+ * own pre-check, which is what picks correctly for everyone else.
+ */
+const TUNNEL_PROTOCOLS = new Set(["quic", "http2"]);
+
+function explicitProtocol(env) {
+  const value = (env.TUNNEL_PROTOCOL ?? "auto").trim().toLowerCase();
+  return TUNNEL_PROTOCOLS.has(value) ? value : null;
+}
+
+function namedTunnelArgs(env) {
+  const protocol = explicitProtocol(env);
+  const prefix = protocol ? ["--protocol", protocol] : [];
+  const token = (env.TUNNEL_TOKEN ?? "").trim();
+  if (token) {
+    const tokenFile = join(STATE_DIR, "tunnel.token");
+    writeFileSync(tokenFile, token, { encoding: "utf8", mode: 0o600 });
+    return ["tunnel", ...prefix, "run", "--token-file", tokenFile];
+  }
+  return ["tunnel", ...prefix, "run", (env.TUNNEL_NAME ?? "").trim()];
+}
+
+/**
+ * `tunnel check` — is a named tunnel configured well enough to try?
+ *
+ * Exists because the interesting failures here are silent. A wrong token or a
+ * missing Public Hostname both produce a tunnel that looks alive on this end, and
+ * the operator finds out from ChatGPT. Catching the config-level half here is the
+ * part that can actually be caught locally.
+ */
+async function cmdTunnelCheck() {
+  const env = parseEnvFile();
+  const mode = tunnelMode(env);
+
+  console.log(`隧道模式 : ${mode === "named" ? "named(固定域名,你自己提供)" : "quick(临时隧道,默认)"}`);
+  if (mode !== "named") {
+    console.log("");
+    console.log("临时隧道不需要配置 —— 每次启动由 Cloudflare 随机分配一个域名,重启就换。");
+    console.log("想要固定域名:TUNNEL_MODE=named + TUNNEL_HOSTNAME + TUNNEL_TOKEN,见 .env.example。");
+    return;
+  }
+
+  console.log(`主机名   : ${namedHostname(env) || "(未填)"}`);
+  console.log(`凭据     : ${(env.TUNNEL_TOKEN ?? "").trim() ? "TUNNEL_TOKEN 已设置(值不打印)" : (env.TUNNEL_NAME ?? "").trim() ? `TUNNEL_NAME=${(env.TUNNEL_NAME ?? "").trim()}` : "(未设置)"}`);
+  console.log(`本地端口 : ${env.PORT ?? "8787"}`);
+  console.log("");
+
+  const problems = namedConfigProblems(env);
+  if (problems.length > 0) {
+    console.error("配置有问题:");
+    for (const p of problems) console.error(`  - ${p}`);
+    process.exit(1);
+  }
+  console.log("配置齐全,可以 `npm run tunnel`。");
+  console.log("");
+  console.log("⚠️  下面这条本机验证不了,得你自己在 Cloudflare 控制台确认:");
+  console.log(`     Zero Trust → Networks → Tunnels → 这条隧道 → Public Hostname`);
+  console.log(`     有一条:域名 ${namedHostname(env)} → Service HTTP → localhost:${env.PORT ?? "8787"}`);
+  console.log("     少了它,隧道显示已连上,但打开域名是 404。");
+
+  const url = configuredTunnelUrl(env);
+  const st = tunnelState();
+  if (readTunnelPid()) {
+    console.log("");
+    console.log(`当前隧道 : ${st.up ? `已连上边缘${st.proto ? `,传输 ${st.proto}` : ""}` : "⚠️ 未连上边缘"}`);
+  }
+  if (url) {
+    const probe = await probePublicHealth(url, 10_000);
+    console.log(`本机回连 : ${probe.ok ? `通 (${probe.detail})` : `不通 (${probe.detail})`}`);
+    if (!probe.ok) {
+      console.log("           ↑ 本机经梯子回连本来就常常不通,这一条**不能**当作隧道坏了。");
+      console.log("             真要看通不通,用手机流量打开:", `${url}/health`);
+    }
+  }
+}
+
+async function cmdStatus() {
   const state = currentStatus();
   const { local } = describeEndpoint(state.env);
   const tunnelPid = readTunnelPid();
-  const tunnelUrl = findTunnelUrl();
+  const tunnelUrl = publicUrl(state.env);
   console.log(`状态     : ${state.disabled ? "已停用 (disabled)" : "已启用 (enabled)"}`);
   console.log(`进程     : ${state.running ? `运行中,PID ${state.pid}` : "未运行"}`);
   console.log(`本地端点 : ${mask(local)}`);
+
+  // Printed on every `status`, deliberately. The whole risk of an unattended
+  // mode is that it is invisible — set once, forgotten, and nothing on screen
+  // ever mentions it again. This is the one line that makes it visible.
+  const mode = autoMode();
+  console.log(`审批模式 : ${autoModeLabel()}`);
+  if (mode.on) {
+    console.log("           ↑ 命令允许名单与链式命令护栏失效,文件工具不再受工作区边界约束。");
+    console.log("             恢复:npm run auto:off");
+    if (!mode.fileOn && mode.envOff) {
+      console.log("             (.env 里的 BRIDGE_CC_APPROVAL=off 不随重启复位 —— 重启也不会恢复。)");
+    }
+  }
+
   if (tunnelPid) {
-    console.log(`隧道     : 运行中,PID ${tunnelPid}`);
+    // 判据是 cloudflared 有没有注册到边缘,不是进程在不在。
+    const st = tunnelState();
+    console.log(
+      `隧道     : ${st.up ? "已连上边缘" : "⚠️ 未连上边缘"}` +
+        `${st.proto ? `,传输 ${st.proto}` : ""},PID ${tunnelPid}`,
+    );
+    console.log(`隧道模式 : ${tunnelMode(state.env) === "named" ? `固定域名 ${namedHostname(state.env)}` : "临时隧道(重启会换域名)"}`);
     console.log(
       `公网端点 : ${
         tunnelUrl ? mask(`${tunnelUrl}/mcp/${state.env.MCP_PATH_SECRET ?? ""}`) : "(地址未知,看 tunnel.log)"
       }`,
     );
+    if (!st.up) {
+      console.log("           ↑ 进程活着但连不上 Cloudflare —— ChatGPT 用不了。");
+      console.log("             试试换传输协议:.env 里加 TUNNEL_PROTOCOL=quic(开 TUN)或 http2(直连),");
+      console.log("             然后 `npm run ctl -- untunnel && npm run ctl -- tunnel`。");
+    } else if (tunnelMode(state.env) === "named") {
+      console.log("           ↑ 固定域名还需要 Cloudflare 那边配了 Public Hostname 才会通");
+      console.log("             (本机查不到它做没做)。核对:`npm run ctl -- tunnel check`");
+    }
   } else {
     console.log(`隧道     : 未运行(要接 ChatGPT 就运行 \`npm run tunnel\`)`);
   }
@@ -372,6 +783,172 @@ function cmdDisable() {
   cmdStop();
   writeFileSync(DISABLED_FLAG, new Date().toISOString());
   console.log("已停用。运行 `npm run enable` 可恢复。");
+}
+
+// --- 审批模式 ---------------------------------------------------------------
+
+/**
+ * Which of the two sources is holding approvals open.
+ *
+ * There are two, and they behave differently, so reporting a single boolean
+ * would be a lie the operator only discovers at the worst moment:
+ *
+ *   file  `.state/auto-approve` — what `auto on` writes. Cleared by every boot.
+ *   env   `BRIDGE_CC_APPROVAL=off` in `.env` — survives restarts. This is the
+ *         escape hatch `scripts/accept.mjs` uses.
+ *
+ * Only the first is auto-reverted, so `auto off` cannot make the second one
+ * stop. Saying so plainly is the difference between a setting and a trap.
+ */
+function autoMode() {
+  const envOff = isApprovalOff(parseEnvFile().BRIDGE_CC_APPROVAL);
+  const fileOn = existsSync(AUTO_APPROVE_FILE);
+  return { envOff, fileOn, on: envOff || fileOn };
+}
+
+function autoModeLabel() {
+  const m = autoMode();
+  if (!m.on) return "需要批准";
+  const via = [m.fileOn ? "临时开关已开" : null, m.envOff ? ".env 里 BRIDGE_CC_APPROVAL=off" : null]
+    .filter(Boolean)
+    .join(" + ");
+  return `⚠️ 完全放行 (${via})`;
+}
+
+/**
+ * What the warning may and may not claim.
+ *
+ * Two of these losses are certain from the code path: with the flag on,
+ * `claude-code.ts` takes the `else` branch and never passes `--mcp-config` /
+ * `--permission-prompt-tool`, so `approval-mcp.ts` is never spawned. The command
+ * allowlist and its chaining guard live in that file, and `checkToolPaths`'s only
+ * production call site is inside it — so both really are gone.
+ *
+ * The old wording also claimed "联网工具,也不再问你". That is *not* verified.
+ * `DEFAULT_ALLOWED` does not list WebFetch/WebSearch, which reads as "denied",
+ * while a measurement recorded in `claude-code.ts` says `--allowedTools` does not
+ * restrict anything at all, which reads as "allowed". The two contradict, and a
+ * security warning is the last place to resolve a contradiction by guessing — so
+ * the claim is out until someone measures it. See 交接.md for the open item.
+ */
+const AUTO_APPROVE_WARNING = [
+  "⚠️  完全放行已开启 —— 不只是「少问几次命令」:",
+  "",
+  "    · 子代理执行任何命令,都不再经过允许名单,链式命令护栏(&&、|、;)也一起失效",
+  "    · 文件工具的工作区边界没了 —— 读写不再限于任务的工作区",
+  "",
+  "    但 DEEPSEEK_ALLOWED_ROOTS 仍然管用:它决定**哪些目录能作为工作区被打开**,",
+  "    放行模式放开的是「打开之后能在里面做什么」。",
+  "",
+  "    只在你正盯着任务跑、且清楚它在做什么的时候开。",
+];
+
+function cmdAuto(args) {
+  const mode = String(args.positional[0] ?? "").toLowerCase();
+
+  if (!mode) {
+    const m = autoMode();
+    console.log(`审批模式 : ${autoModeLabel()}`);
+    console.log("");
+    if (m.envOff) {
+      console.log("注意:.env 里有 BRIDGE_CC_APPROVAL=off,它不随重启复位 ——");
+      console.log("      下面那个「恢复审批」对它无效,要改请编辑 .env 删掉这一行。");
+      console.log("");
+    }
+    console.log("切换:");
+    console.log("  完全放行 : npm run auto:on     (或 npm run ctl -- auto on)");
+    console.log("  恢复审批 : npm run auto:off    (或 npm run ctl -- auto off)");
+    console.log("");
+    console.log("完全放行只是**临时**的:服务一重启就自动恢复成「需要批准」。");
+    return;
+  }
+
+  if (mode !== "on" && mode !== "off") {
+    console.error(`用法:npm run ctl -- auto [on|off]    (给了 "${mode}")`);
+    process.exit(1);
+  }
+
+  if (mode === "off") {
+    ensureStateDir();
+    if (!existsSync(AUTO_APPROVE_FILE)) {
+      console.log("本来就是「需要批准」,没有改动。");
+    } else {
+      rmSync(AUTO_APPROVE_FILE, { force: true });
+      auditEvent(STATE_DIR, { type: "auto_approve_off", by: "ctl" });
+      console.log("已恢复「需要批准」。");
+    }
+    if (autoMode().envOff) {
+      console.log("");
+      console.log("⚠️  但 .env 里还有 BRIDGE_CC_APPROVAL=off —— 完全放行**仍然生效**。");
+      console.log("    要从 .env 里删掉那一行,再 `npm run ctl -- reload`。");
+    }
+    return;
+  }
+
+  // Turn on. Refused while the server is down, because boot clears this file —
+  // writing it now would look like it worked and then silently do nothing the
+  // moment the service starts. A setting that lies about being set is worse than
+  // one that says "not yet".
+  const state = currentStatus();
+  if (state.disabled) {
+    console.error("插件处于停用状态。先运行 `npm run enable`。");
+    process.exit(1);
+  }
+  if (!state.running) {
+    console.error("服务没在运行,现在开没有意义 —— 服务一启动就会把这个标志清掉。");
+    console.error("先 `npm start`(或 `npm run tunnel`),再运行 `npm run auto:on`。");
+    process.exit(1);
+  }
+
+  ensureStateDir();
+  writeFileSync(AUTO_APPROVE_FILE, new Date().toISOString());
+  auditEvent(STATE_DIR, { type: "auto_approve_on", by: "ctl" });
+
+  for (const line of AUTO_APPROVE_WARNING) console.log(line);
+  console.log("");
+  console.log("已生效 —— 从**下一个**任务开始,不用重启服务。");
+  console.log("恢复审批:npm run auto:off;或直接重启服务(`npm run ctl -- reload`),也会自动恢复。");
+}
+
+/**
+ * Put the exact connector URL on the clipboard.
+ *
+ * The full URL is one long unbroken string with a 64-hex-character tail, which
+ * is precisely the shape that is miserable to select by hand out of a terminal
+ * and easy to truncate by one character when you do. `rotate` already hands its
+ * result to the clipboard for that reason; this is the same courtesy for the
+ * everyday case — including after a quick tunnel is handed a new hostname.
+ */
+function cmdUrl() {
+  const env = parseEnvFile();
+  const base = publicUrl(env);
+  if (!base) {
+    console.error("现在没有公网地址。");
+    console.error(
+      tunnelMode(env) === "named"
+        ? "  TUNNEL_MODE=named 但 TUNNEL_HOSTNAME 没填。看:npm run ctl -- tunnel check"
+        : "  隧道没在跑。先 `npm run tunnel`(临时隧道每次重启都会换地址)。",
+    );
+    process.exit(1);
+  }
+  const full = `${base}/mcp/${env.MCP_PATH_SECRET ?? ""}`;
+  console.log(`公网端点 : ${mask(full)}`);
+  if (!flags.has("--show")) console.log("(密钥默认隐藏;要打印完整 URL 加 --show)");
+  if (flags.has("--show")) {
+    console.log(
+      copyToClipboard(full)
+        ? "已复制到剪贴板 —— 直接粘进 ChatGPT → Settings → Plugins → MCP 就行。"
+        : "复制到剪贴板失败。手动复制上面那一行。",
+    );
+  } else {
+    // Still copy the real value: a clipboard is not a log, and needing --show
+    // just to get a working clipboard would defeat the masking above.
+    console.log(
+      copyToClipboard(full)
+        ? "已复制到剪贴板(剪贴板里是完整的,屏幕上是隐藏的)。"
+        : "复制到剪贴板失败。加 --show 打印完整 URL 再手动复制。",
+    );
+  }
 }
 
 function cmdLogs() {
@@ -439,6 +1016,22 @@ function copyToClipboard(text) {
  * Returns the PID that was stopped, or null if nothing was running.
  */
 function killServerOnly() {
+  // Every caller of this restarts the server, and every server boot clears the
+  // auto-approve flag — that is the guarantee the operator asked for. But it
+  // turns `reload` and `rotate` (and `allow`, which reloads) into silent
+  // revocations: you flip unattended mode on, later add a workspace root, and
+  // the mode is gone with nothing on screen saying so. Warn here, in the one
+  // function all of those paths go through, rather than at each call site.
+  //
+  // Deliberately *not* preserving the flag across a restart. That would trade
+  // away the exact property the feature was built around — "重启就回到需要批准"
+  // — to save one command.
+  if (existsSync(AUTO_APPROVE_FILE)) {
+    console.log("");
+    console.log("注意:这次重启会收回「完全放行」(这是设计如此 —— 重启即恢复需要批准)。");
+    console.log("      还要放行的话,起来之后重新运行:npm run auto:on");
+    console.log("");
+  }
   const pid = readPid();
   if (!pid || !isAlive(pid)) return null;
   if (isWindows) {
@@ -499,7 +1092,10 @@ function cmdRotate() {
   console.log(pid ? `[2/3] 已停止旧服务(PID ${pid}),用新密钥重启…` : "[2/3] 服务本来就没在跑,直接启动…");
   cmdStart();
 
-  const url = findTunnelUrl();
+  // `publicUrl`, not `findTunnelUrl`: a named tunnel never prints a
+  // trycloudflare URL, so scraping the log would report "没有公网地址" and skip
+  // the clipboard on a tunnel that is up and has a perfectly good address.
+  const url = publicUrl(parseEnvFile());
   if (!readTunnelPid() || !url) {
     console.log("");
     console.log("[3/3] 隧道没在运行,所以还没有公网地址。");
@@ -650,6 +1246,17 @@ function cmdAudit(lines) {
         console.log(mask(`[${time}] ${e.decision === "allow" ? "已批准  " : "已拒绝  "} ${e.id}  ${e.reason ?? ""}`));
       } else if (e.type === "approval_timeout") {
         console.log(`[${time}] 超时拒绝  ${e.id}`);
+      } else if (e.type === "auto_approve_on") {
+        // These three are the only audit lines unattended mode produces, and
+        // they are exactly the ones that must be legible: in that mode the
+        // approval MCP is never spawned, so no `approval_*` line can be written
+        // at all. A raw JSON blob here would bury the mode change in the one
+        // place a human ever reads this file.
+        console.log(`[${time}] ⚠️ 完全放行 已开启 —— 从此命令/文件/联网不再询问(${e.by ?? "?"})`);
+      } else if (e.type === "auto_approve_off") {
+        console.log(`[${time}] 已恢复审批 —— 完全放行关闭(${e.by ?? "?"})`);
+      } else if (e.type === "auto_approve_cleared") {
+        console.log(`[${time}] 服务启动,自动收回完全放行  ${e.reason ?? ""}`);
       } else {
         console.log(mask(`[${time}] ${e.type}  ${JSON.stringify(e).slice(0, 160)}`));
       }
@@ -665,7 +1272,7 @@ function cmdUninstall({ purge = false } = {}) {
   console.log("本地状态已清除。");
   console.log("");
   console.log("还需要手动做一步(这个脚本碰不到 ChatGPT):");
-  console.log("  打开 ChatGPT 网页版 → Settings → Plugins → MCP → 删除 deepseek-bridge 这个 server。");
+  console.log("  打开 ChatGPT 网页版 → Settings → Plugins → MCP → 删除 modelbridge 这个 server。");
   if (purge) {
     console.log("");
     console.log("--purge 已指定,但为安全起见不自动删除项目目录。");
@@ -680,22 +1287,131 @@ function readRoots() {
     .filter(Boolean);
 }
 
-function writeRoots(roots) {
+/**
+ * Set one key in `.env`, line by line, keeping everything else.
+ *
+ * Not a whole-file regex replace (which is what `cmdSecret`/`cmdRotate` do, and
+ * is fine there because they rewrite the one line they own). Two things make
+ * that shape wrong for general use: it anchors at column 0, so an indented line
+ * silently escapes it, and it matches only the first occurrence. This maps over
+ * the lines instead — whitespace-tolerant, replaces every occurrence, appends
+ * when absent, and preserves comments and blank lines exactly as the operator
+ * left them. `writeRoots` has worked this way for a while; this is that, named.
+ */
+function writeEnvKey(key, value) {
   const lines = existsSync(ENV_FILE) ? readFileSync(ENV_FILE, "utf8").split(/\r?\n/) : [];
-  const value = roots.join(";");
+  const pattern = new RegExp(`^\\s*${key}\\s*=`);
   let hit = false;
   const out = lines.map((line) => {
-    if (/^\s*DEEPSEEK_ALLOWED_ROOTS\s*=/.test(line)) {
+    if (pattern.test(line)) {
       hit = true;
-      return `DEEPSEEK_ALLOWED_ROOTS=${value}`;
+      return `${key}=${value}`;
     }
     return line;
   });
   if (!hit) {
     while (out.length && out[out.length - 1] === "") out.pop();
-    out.push(`DEEPSEEK_ALLOWED_ROOTS=${value}`, "");
+    out.push(`${key}=${value}`, "");
   }
   writeFileSync(ENV_FILE, out.join("\n"), "utf8");
+}
+
+function writeRoots(roots) {
+  writeEnvKey("DEEPSEEK_ALLOWED_ROOTS", roots.join(";"));
+}
+
+/**
+ * Read one line from the terminal.
+ *
+ * Used for the tunnel token because a command-line argument is the wrong place
+ * for a credential: argv is readable by any process on this machine for the life
+ * of the command, and `npm run` prints the whole invocation back. This is not a
+ * hidden prompt — the terminal echoes what you paste, same as pasting it into an
+ * editor would — but it stays out of the process list and out of npm's output.
+ */
+function ask(question) {
+  return new Promise((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stderr });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
+/**
+ * `tunnel named` — the whole Cloudflare setup, minus the dashboard.
+ *
+ * Hand-editing `.env` is the documented path, but the token is a ~150-character
+ * opaque blob: pasting it into a text file next to two other keys is where a
+ * truncation happens, and a truncated token fails later with an error that says
+ * nothing about truncation. This writes all three keys through `writeEnvKey`,
+ * takes the token off stdin rather than argv, and then tells the operator the one
+ * step that is left — which is on Cloudflare's side and not on this machine.
+ */
+async function cmdTunnelNamed(args) {
+  if (!existsSync(ENV_FILE)) {
+    console.error(".env 不存在。先复制 .env.example 为 .env 并填写。");
+    process.exit(1);
+  }
+
+  const host = String(args.positional[1] ?? "")
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/, "");
+  if (!host) {
+    console.error("用法: npm run ctl -- tunnel named <你的域名>");
+    console.error("例如: npm run ctl -- tunnel named mcp.example.com");
+    process.exit(1);
+  }
+  if (!host.includes(".")) {
+    console.error(`"${host}" 看着不像一个域名。要形如 mcp.example.com。`);
+    process.exit(1);
+  }
+
+  console.log("这个域名必须已经托管在 Cloudflare 上(NS 指向 Cloudflare),否则后面那步加不了。");
+  console.log("");
+  console.log("接下来需要一个隧道 token,在 Cloudflare 控制台拿:");
+  console.log("  Zero Trust → Networks → Tunnels → Create a tunnel → 选 Cloudflared");
+  console.log("  创建后页面上会给一串很长的 token,复制它。");
+  console.log("  (如果这条隧道已经建好了:点进去 → Configure → 也能看到 token)");
+  console.log("");
+
+  const token = await ask("把 token 粘进来,然后回车:");
+  if (!token) {
+    console.error("没读到 token,取消。");
+    process.exit(1);
+  }
+  if (token.length < 40) {
+    console.error(`这串只有 ${token.length} 个字符,不像完整的 token(通常 150 以上)。`);
+    console.error("多半是复制少了。重新运行一次,把整串复制全。");
+    process.exit(1);
+  }
+
+  writeEnvKey("TUNNEL_MODE", "named");
+  writeEnvKey("TUNNEL_HOSTNAME", host);
+  writeEnvKey("TUNNEL_TOKEN", token);
+  console.log("");
+  console.log(`已写入 .env:TUNNEL_MODE=named / TUNNEL_HOSTNAME=${host} / TUNNEL_TOKEN=<已隐藏>`);
+  console.log("");
+  console.log("═".repeat(62));
+  console.log("还剩一步,这一步只能在 Cloudflare 网页上做 —— 本机做不了:");
+  console.log("");
+  console.log(`  Zero Trust → Networks → Tunnels → 选中这条隧道 → Public Hostname → Add`);
+  console.log(`    域名(Subdomain) : ${host.split(".")[0]}`);
+  console.log(`    域(Domain)       : ${host.split(".").slice(1).join(".")}`);
+  console.log(`    Service 类型     : HTTP`);
+  console.log(`    Service URL      : localhost:${parseEnvFile().PORT ?? "8787"}`);
+  console.log("");
+  console.log("  漏了这一步:隧道会显示「已连上边缘」,但打开域名是 404。");
+  console.log("═".repeat(62));
+  console.log("");
+  console.log("做完之后:");
+  console.log("  npm run ctl -- tunnel check     # 检查配置");
+  console.log("  npm run ctl -- untunnel && npm run tunnel");
+  console.log("");
+  console.log(`之后公网地址就固定是 https://${host}/… —— 重启、重开电脑都不变,`);
+  console.log("ChatGPT 那个 connector 只需要建这一次。");
 }
 
 /** 盘根、用户目录、`C:\Users` —— 这些不是"一个项目",是整台机器。 */
@@ -795,7 +1511,7 @@ switch (command) {
     cmdReload();
     break;
   case "status":
-    cmdStatus();
+    await cmdStatus();
     break;
   case "enable":
     cmdEnable();
@@ -813,10 +1529,18 @@ switch (command) {
     cmdRotate();
     break;
   case "tunnel":
-    await cmdTunnel();
+    if (positional[0] === "check") await cmdTunnelCheck();
+    else if (positional[0] === "named") await cmdTunnelNamed({ positional, flags });
+    else await cmdTunnel();
     break;
   case "untunnel":
     cmdUntunnel();
+    break;
+  case "auto":
+    cmdAuto({ positional, flags });
+    break;
+  case "url":
+    cmdUrl();
     break;
   case "uninstall":
     cmdUninstall({ purge: flags.has("--purge") });
@@ -847,7 +1571,7 @@ switch (command) {
     cmdAudit(flags.has("--all") ? 500 : 30);
     break;
   default:
-    console.log(`deepseek-bridge 生命周期管理
+    console.log(`modelbridge 生命周期管理
 
 用法: npm run <命令>
 
@@ -856,9 +1580,15 @@ switch (command) {
   stop         停止服务和隧道
   restart      重启服务(隧道若在跑会一起停掉,需重新 tunnel)
   reload       只重启服务,不动隧道 —— 公网 URL 不变,改了代码或 .env 后用这个
-  status       查看启用状态、进程、本地与公网端点
+  status       查看启用状态、进程、审批模式、本地与公网端点
   logs         查看最近 40 行日志
+  url          把完整的公网 URL 复制到剪贴板(省得手抄一长串)
+  auto         查看当前审批模式
+  auto on      完全放行:命令允许名单与工作区边界失效(重启自动恢复)
+  auto off     恢复「需要批准」
   tunnel       启动 Cloudflare 隧道,打印可填进 ChatGPT 的公网 URL
+  tunnel check 检查固定隧道的配置,并说清 Cloudflare 那边还差什么
+  tunnel named <域名>   改用固定域名(引导你走完 Cloudflare 的步骤)
   untunnel     只停隧道,服务继续跑
   enable       解除停用
   disable      停用并停止服务

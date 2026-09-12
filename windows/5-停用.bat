@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title DeepSeek Bridge - STOP
+title ModelBridge - STOP
 cd /d "%~dp0.."
 
 echo ============================================================

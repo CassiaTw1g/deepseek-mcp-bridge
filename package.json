@@ -1,9 +1,9 @@
 {
-  "name": "deepseek-bridge",
+  "name": "modelbridge",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "MCP bridge exposing DeepSeek V4.1 Flash as a tool for ChatGPT Work",
+  "description": "MCP server that gives an MCP host a working sub-agent whose brain can be any Anthropic-compatible model",
   "scripts": {
     "ctl": "node scripts/ctl.mjs",
     "start": "node scripts/ctl.mjs start",
@@ -12,6 +12,10 @@
     "reload": "node scripts/ctl.mjs reload",
     "status": "node scripts/ctl.mjs status",
     "logs": "node scripts/ctl.mjs logs",
+    "url": "node scripts/ctl.mjs url",
+    "auto": "node scripts/ctl.mjs auto",
+    "auto:on": "node scripts/ctl.mjs auto on",
+    "auto:off": "node scripts/ctl.mjs auto off",
     "tunnel": "node scripts/ctl.mjs tunnel",
     "untunnel": "node scripts/ctl.mjs untunnel",
     "enable": "node scripts/ctl.mjs enable",

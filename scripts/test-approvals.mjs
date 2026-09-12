@@ -11,13 +11,17 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  AUTO_APPROVE_FLAG,
+  auditEvent,
   autoApprove,
+  autoApproveOn,
   awaitDecision,
   decide,
+  isApprovalOff,
   listPending,
   readDecision,
   requestApproval,
@@ -259,5 +263,105 @@ test("审计日志记录了请求、人工批准与超时", async () => {
     assert.match(log, /approval_requested/);
     assert.match(log, /approval_decided/);
     assert.match(log, /approval_timeout/);
+  });
+});
+
+// --- 完全放行开关 ------------------------------------------------------------
+//
+// 这个开关是整个项目里唯一一个"把闸门全部拆掉"的东西,所以它的判据值得单独钉住。
+// 它还有一点和别的设置不同:判据是**每个任务**求值一次的,不是进程启动时 ——
+// 这正是"改了立刻生效、不用重启"能成立的原因。哪天有人把它挪到别处缓存起来,
+// 这一组用例要能立刻发现。
+
+/** 环境变量是本机全局的,跑完必须还原,否则会污染同一进程里的其它用例。 */
+function withEnv(value, fn) {
+  const saved = process.env.BRIDGE_CC_APPROVAL;
+  if (value === undefined) delete process.env.BRIDGE_CC_APPROVAL;
+  else process.env.BRIDGE_CC_APPROVAL = value;
+  try {
+    return fn();
+  } finally {
+    if (saved === undefined) delete process.env.BRIDGE_CC_APPROVAL;
+    else process.env.BRIDGE_CC_APPROVAL = saved;
+  }
+}
+
+test("默认是需要批准 —— 没有标志文件、也没有环境变量", async () => {
+  await withStateDir((dir) => {
+    withEnv(undefined, () => {
+      assert.equal(autoApproveOn(dir), false);
+    });
+  });
+});
+
+test("标志文件存在即完全放行,内容不参与判断", async () => {
+  await withStateDir((dir) => {
+    withEnv(undefined, () => {
+      // 空文件。判据是"存在",不是"内容为真" —— 写时间戳的惯例不能变成约束。
+      writeFileSync(join(dir, AUTO_APPROVE_FLAG), "");
+      assert.equal(autoApproveOn(dir), true, "空文件也必须算「开」");
+
+      writeFileSync(join(dir, AUTO_APPROVE_FLAG), "not a timestamp at all");
+      assert.equal(autoApproveOn(dir), true, "内容是什么都不该影响判断");
+    });
+  });
+});
+
+test("删掉标志文件就回到需要批准 —— 这就是重启时的收回动作", async () => {
+  await withStateDir((dir) => {
+    withEnv(undefined, () => {
+      writeFileSync(join(dir, AUTO_APPROVE_FLAG), new Date().toISOString());
+      assert.equal(autoApproveOn(dir), true);
+      rmSync(join(dir, AUTO_APPROVE_FLAG), { force: true });
+      assert.equal(autoApproveOn(dir), false);
+    });
+  });
+});
+
+test("环境变量是另一条腿,即使没有标志文件也放行", async () => {
+  await withStateDir((dir) => {
+    withEnv("off", () => {
+      assert.equal(autoApproveOn(dir), true);
+    });
+  });
+});
+
+test("off 的大小写与空白都认 —— server 与 ctl status 不能各读各的", async () => {
+  await withStateDir((dir) => {
+    for (const value of ["off", "OFF", "Off", " off ", "\toff"]) {
+      withEnv(value, () => {
+        assert.equal(autoApproveOn(dir), true, `"${value}" 应当算 off`);
+        assert.equal(isApprovalOff(value), true, `"${value}" 应当算 off`);
+      });
+    }
+    // 反向:别的值不能意外打开放行。这里只要有一个漏了,就是一条没人批准的通道。
+    for (const value of ["on", "true", "1", "no", "offf", "", " "]) {
+      withEnv(value, () => {
+        assert.equal(autoApproveOn(dir), false, `"${value}" 不该算 off`);
+        assert.equal(isApprovalOff(value), false, `"${value}" 不该算 off`);
+      });
+    }
+  });
+});
+
+test("放行模式下审批队列不再被写入,但模式变更必须留下审计行", async () => {
+  await withStateDir((dir) => {
+    withEnv(undefined, () => {
+      // 放行时 approval-mcp 根本不会启动,所以 approval_* 这类逐条记录不可能出现。
+      // 剩下的只有模式变更这几行 —— 它们是事后唯一能看出"那段时间是敞开的"的东西,
+      // 所以它们必须真的落盘。
+      writeFileSync(join(dir, AUTO_APPROVE_FLAG), new Date().toISOString());
+      auditEvent(dir, { type: "auto_approve_on", by: "ctl" });
+      rmSync(join(dir, AUTO_APPROVE_FLAG), { force: true });
+      auditEvent(dir, { type: "auto_approve_cleared", reason: "服务启动,自动收回完全放行。" });
+
+      const lines = readFileSync(join(dir, "audit.log"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      assert.deepEqual(
+        lines.map((l) => l.type),
+        ["auto_approve_on", "auto_approve_cleared"],
+      );
+      for (const line of lines) assert.equal(typeof line.at, "number", "每行都要有可排序的时间戳");
+      assert.equal(existsSync(join(dir, AUTO_APPROVE_FLAG)), false);
+    });
   });
 });

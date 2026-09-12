@@ -141,6 +141,53 @@ export function autoApprove(command: string, allow: string[] = DEFAULT_ALLOW): {
   return { approved: false, reason: `命令 ${name} 不在预放行名单里。` };
 }
 
+/**
+ * The unattended switch, as a file rather than a `.env` key.
+ *
+ * `BRIDGE_CC_APPROVAL=off` already existed and does the same thing, so why a
+ * second mechanism? Because `dotenv/config` freezes `process.env` at boot, and
+ * the whole point here is a toggle the operator can flip *without* a restart.
+ * A file is read fresh on every job, so the next job sees the new mode.
+ *
+ * Presence is the state — the contents are an ISO timestamp nobody parses.
+ * Same convention as `.state/disabled`.
+ */
+export const AUTO_APPROVE_FLAG = "auto-approve";
+
+/**
+ * True when approvals are off. Read per job, not per process: `claude-code.ts`
+ * calls this each time it builds argv, which is what makes the toggle instant.
+ *
+ * The env var is kept as an OR arm rather than replaced. `scripts/accept.mjs`
+ * sets it, and it is the escape hatch that works even if the state directory is
+ * unwritable — the one case a file-based flag cannot cover.
+ */
+export function autoApproveOn(stateDir: string): boolean {
+  if (isApprovalOff(process.env.BRIDGE_CC_APPROVAL)) return true;
+  return existsSync(join(stateDir, AUTO_APPROVE_FLAG));
+}
+
+/**
+ * The single definition of "off", shared with `ctl`.
+ *
+ * It used to be a strict `=== "off"` in one place and a trim+lowercase in
+ * another, which meant `BRIDGE_CC_APPROVAL=OFF` (entirely natural to type in a
+ * file full of SHOUTING keys) was read one way by the server and the other way
+ * by `ctl status`. Here the two can no longer disagree. Whitespace and case are
+ * forgiven because hand-edited `.env` files carry both.
+ *
+ * `ctl` imports this rather than reimplementing it — it reads `.env` itself
+ * instead of going through `dotenv`, so it cannot call `autoApproveOn`.
+ */
+export function isApprovalOff(value: string | undefined): boolean {
+  return (value ?? "").trim().toLowerCase() === "off";
+}
+
+/** Thin export over the private `audit()` so `ctl` can log mode changes too. */
+export function auditEvent(stateDir: string, entry: Record<string, unknown>): void {
+  audit(stateDir, entry);
+}
+
 function approvalDir(stateDir: string): string {
   return join(stateDir, "approvals");
 }

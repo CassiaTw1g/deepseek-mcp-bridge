@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title DeepSeek Bridge - SELF TEST
+title ModelBridge - SELF TEST
 cd /d "%~dp0.."
 
 echo ============================================================

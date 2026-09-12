@@ -186,7 +186,7 @@ function errorText(text: string) {
 export function createMcpServer(registry?: Registry, policy?: SandboxPolicy): McpServer {
   // Must match package.json. It said 2.0.0 while the package said 1.0.0, so
   // every client was told a version this repository has never had.
-  const server = new McpServer({ name: "deepseek-bridge", version: "1.0.0" });
+  const server = new McpServer({ name: "modelbridge", version: "1.0.0" });
 
   server.registerTool(
     "deepseek_flash",

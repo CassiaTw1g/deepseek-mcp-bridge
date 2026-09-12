@@ -1,6 +1,8 @@
-# deepseek-mcp-bridge
+# ModelBridge
 
-An MCP server that exposes **DeepSeek** as a tool for ChatGPT connectors (and any other MCP client) — and, optionally, as a sub-agent that reads files, runs commands, and works a multi-step task to completion on your machine.
+An MCP server that gives a ChatGPT connector (or any other MCP client) a **working sub-agent** — and, optionally, one that reads files, runs commands, and works a multi-step task to completion on your machine.
+
+It ships pointed at **DeepSeek**, which is the cheap default rather than the point. The design is model-agnostic: the sub-agent's brain is whatever Anthropic-compatible endpoint you put in `DEEPSEEK_BASE_URL`, and the harness around it is a swappable part. That is where the name comes from.
 
 [中文说明](README.zh-CN.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
@@ -100,8 +102,8 @@ Once a tool call reaches that approval prompt it is routed one of three ways, an
 ## Quick start
 
 ```bash
-git clone https://github.com/CassiaTw1g/deepseek-mcp-bridge.git
-cd deepseek-mcp-bridge
+git clone https://github.com/CassiaTw1g/modelbridge.git
+cd modelbridge
 npm install
 cp .env.example .env
 ```
@@ -193,6 +195,11 @@ All via `.env` (gitignored):
 | `MCP_PATH_SECRET` | — | **Required**, min 16 chars. The capability path segment. `npm run ctl -- secret` generates a 32-byte hex value. |
 | `PORT` | `8787` | Local listen port. |
 | `HOST` | `127.0.0.1` | Listen address. **Leave on loopback** — the tunnel runs on the same machine, so exposing the port to your LAN has no upside. |
+| `TUNNEL_MODE` | `quick` | `quick` = a Cloudflare quick tunnel: zero setup, but a **new random `*.trycloudflare.com` hostname on every start**, so the ChatGPT connector has to be rebuilt each time (`Unauthorized: Tunnel not found` once Cloudflare recycles it). `named` = a fixed tunnel on **your own** domain — see [A fixed hostname on your own domain](#a-fixed-hostname-on-your-own-domain). |
+| `TUNNEL_HOSTNAME` | — | Named mode. Your public hostname, e.g. `mcp.example.com` — no `https://`, no path. It must already be on Cloudflare, or the dashboard cannot route it. |
+| `TUNNEL_TOKEN` | — | Named mode. The credential the Cloudflare dashboard issues for the tunnel. **A full credential**, on the same footing as `MCP_PATH_SECRET`: masked by `ctl`, never printed, never committed. Do not type it into a file by hand — `npm run ctl -- tunnel named <hostname>` asks for it and writes it. |
+| `TUNNEL_NAME` | — | Named mode, alternative to `TUNNEL_TOKEN`: the name of a tunnel you created with the `cloudflared` CLI. On that path cloudflared reads its own config and credentials, so the routing rule lives **there**, not in `TUNNEL_HOSTNAME` — keep the two in step. |
+| `TUNNEL_PROTOCOL` | *(probe)* | Transport cloudflared uses to reach the edge: `quic` (UDP 7844) or `http2` (TCP 7844). Leave unset and let it probe. Pin `quic` **behind a proxy or TUN-mode VPN** — TUN swallows outbound TCP/7844 while UDP passes straight through. The wrong choice fails quietly: the process stays alive and `ctl status` says "running" while nothing is reachable and the log repeats `TLS handshake with edge error: EOF`. Applies to both modes. |
 | `RATE_LIMIT_PER_MINUTE` | `60` | Sliding window that limits the blast radius if the URL leaks. **One global bucket, not per IP** — the server listens on loopback and the only client is the tunnel, so `X-Forwarded-For` is whatever the caller typed, and trusting it would make the limit read as "N/min per made-up IP". Only `tools/call` is counted: a single poll can cost three requests (initialize, tools/list, call), so counting handshakes would let a long job 429 itself with its own polling. |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | OpenAI-compatible endpoint. |
 | `DEEPSEEK_MODEL` | `deepseek-flash` | Model ID. |
@@ -210,7 +217,7 @@ All via `.env` (gitignored):
 | `BRIDGE_JOB_TIMEOUT_MS` | `1800000` | Wall-clock ceiling (30 min). On expiry the job and its entire process tree are killed. `server.ts` sets the registry's own hard wall to this value + 1 min so the runner's timeout always fires first — if the hard wall won the race it would report the stop as a plain *cancellation*, which says nothing about why. |
 | `BRIDGE_APPROVAL_TIMEOUT_MS` | `300000` | How long a command waits for a human (5 min). **Expiry is a deny.** |
 | `BRIDGE_APPROVE_ALLOW` | see `DEFAULT_ALLOW` | Comma-separated pre-approved command *names* — `node`, `npm`, `git`, `dir`, `type`, … plus PowerShell's read-only cmdlets. Matched against the **first word only**, so it constrains the program, not its arguments. Anything else pauses the job for a human. This list covers **commands only**: file access outside the workspace, and every network tool, goes to a human regardless. |
-| `BRIDGE_CC_APPROVAL` | on | Set to `off` to skip the approval queue entirely — every command then runs unattended. Only for `npm run accept`. |
+| `BRIDGE_CC_APPROVAL` | on | Set to `off` to skip the approval queue entirely. ⚠️ What it removes is more than "the asking": the `approval-mcp.ts` child process is never spawned, so the command allowlist, the chaining guard and the file tools' workspace boundary **all go with it**. ⚠️ It does **not** reset on restart, which makes it a poor everyday switch — for a temporary bypass use `npm run auto:on` instead, which the next restart revokes by itself. Left commented; only `npm run accept` overrides it explicitly. |
 | `BRIDGE_CLAUDE_BIN` | `claude` on `PATH` | Path to the Claude Code binary. |
 | `BRIDGE_ANTHROPIC_BASE_URL` | `$DEEPSEEK_BASE_URL/anthropic` | Where the harness sends its requests. |
 | `BRIDGE_STATE_DIR` | `<repo>/.state` | Job snapshots, approval queue, audit log. |
@@ -225,14 +232,22 @@ npm run stop       # stop server and tunnel
 npm run restart    # restart server (stops the tunnel too — re-run `npm run tunnel`)
 npm run status     # enabled state, PIDs, local + public endpoints
 npm run logs       # last 40 log lines
+npm run url        # copy the full connector URL to the clipboard, and print it
 npm run tunnel     # start the Cloudflare tunnel, print the public URL
 npm run untunnel   # stop the tunnel only
+npm run auto       # show the current approval mode
+npm run auto:on    # bypass approvals entirely (see Security model)
+npm run auto:off   # back to "needs approval"
 npm run enable     # clear the disabled flag
 npm run disable    # stop everything and set the disabled flag
 npm run uninstall  # stop and clear local state (leaves the project directory)
 ```
 
 `npm run start --foreground` runs in the foreground for debugging.
+
+`npm run url` is the one to reach for when rebuilding the ChatGPT connector: it
+prints `https://<host>/mcp/<secret>` and puts the same string on your clipboard,
+so you never have to hand-select the secret out of `npm run status --show`.
 
 ### Rotating the path secret
 
@@ -269,10 +284,32 @@ Three ways out:
 | Approach | Cost | Result |
 |---|---|---|
 | **Do nothing** | none | Usually enough. `reload` leaves the tunnel alone and `ctl` no longer prints the secret, so in normal operation the URL does not move. You rebuild the connector only when you deliberately rotate the secret. |
+| **A Cloudflare named tunnel** | you must **own a domain** already on Cloudflare | The hostname half of the URL **never changes** — built in, see below. |
 | **A tunnel with a permanent hostname** | install one tool, create one account | The hostname half of the URL **never changes**. [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) is the lowest-effort option: free for personal use, giving you `https://<machine>.<tailnet>.ts.net` with no domain to buy. *Not yet verified against this bridge.* |
-| Cloudflare named tunnel | you must **own a domain** and move its DNS to Cloudflare | Same result, your own domain. |
 
-Start with the first row. Move to Tailscale Funnel only if an occasional rebuild still bothers you.
+Start with the first row. Move on only if an occasional rebuild still bothers you.
+
+#### A fixed hostname on your own domain
+
+The quick tunnel is the default because it needs no setup. If you have a domain whose NS already points at Cloudflare, you can have a URL that survives restarts, reboots and `restart` alike — so the connector is built once and never touched again.
+
+```bash
+npm run ctl -- tunnel named mcp.example.com
+```
+
+It asks for the tunnel token (paste it — do not retype it into a file by hand), writes your `.env` for you, and then tells you the one step that only you can do:
+
+```
+Zero Trust → Networks → Tunnels → your tunnel → Public Hostname → Add
+  Service type : HTTP
+  Service URL  : localhost:8787
+```
+
+⚠️ **Skipping that step is the trap.** The tunnel will report `connected to the edge`, everything local looks healthy, and the domain returns 404 — because the "hostname → local port" route lives in Cloudflare's cloud, not on this machine. `npm run ctl -- tunnel check` lists what you have not done yet, and reports "registered with the edge" and "the domain actually answers" **separately**, because they are different facts.
+
+Nothing real is hardcoded here: the code and docs carry no one's domain, and every value comes from your own `.env`. `TUNNEL_TOKEN` is a credential on the same footing as the path secret — it is never printed, and `ctl` masks it.
+
+> **Do not use the free ngrok tier.** It injects a browser-warning page that needs an `ngrok-skip-browser-warning` request header to get past, and a ChatGPT connector cannot set custom headers — the connection is cut.
 
 ### Agent job and approval commands
 
@@ -413,6 +450,35 @@ The guardrails, and — just as importantly — [what they are *not*](SECURITY.m
 - **Clear `DEEPSEEK_ALLOWED_ROOTS` and restart to go back to tier 1.** That is a supported configuration and the recommended place to start: run read-only for a while, confirm the URL has not leaked, and only then consider turning it on.
 
 **This is not a security boundary. It is an observation window.** The only real boundary is a sandbox or a VM — be at the machine while jobs run. Do not ship a public deployment of this with agent capabilities enabled.
+
+### Temporarily disabling approvals altogether (`npm run auto:on`)
+
+While you are watching a batch of jobs run, approving commands one at a time is tedious. This switch turns the approval queue off wholesale:
+
+```bash
+npm run auto        # which mode am I in
+npm run auto:on     # fully unattended
+npm run auto:off    # back to "needs approval"
+```
+
+**It removes more than you probably expect.** It is not "commands stop asking" — the `approval-mcp.ts` child process is never spawned, so everything hanging off it goes away together:
+
+| Gate | Under the bypass |
+|---|---|
+| Command allow-list | gone |
+| Chaining guard (`;` `&&` `\|\|` `\|`, redirection) | gone |
+| File tools' workspace boundary | gone |
+| Per-request approval records in `audit.log` | no longer produced |
+
+**What still applies:** `DEEPSEEK_ALLOWED_ROOTS` still decides **which directories may be opened as a workspace**. The bypass loosens what happens *inside* one, not which ones can be opened.
+
+**A restart revokes it.** The switch is a flag file at `.state/auto-approve` (not a `.env` key), and every service start deletes it. So `reload` / `restart` / rebooting all land back on "needs approval". That is on purpose: the bypass means "I am watching this job right now", not "I have stopped caring". `reload`, `rotate` and `allow` all restart the service and therefore revoke it too — each of them says so before it does.
+
+Turning it on needs **no restart** — it takes effect on the next job (the check is re-read per job).
+
+> `BRIDGE_CC_APPROVAL=off` in `.env` is the other path and does **not** reset on restart. It is kept for `npm run accept`. If both are on, `auto off` only clears the flag file, and `ctl status` tells you plainly that the `.env` one is still live.
+
+**An honest note on auditing:** under the bypass there are no `approval_requested` / `approval_auto` lines any more — the process that writes them never starts. What remains is the mode-change lines (`auto_approve_on` / `auto_approve_off` / `auto_approve_cleared`) and the harness's own tool-call trace in `.state/jobs/<id>.json` (one entry per call, capped at 400, readable with `npm run ctl -- jobs <id> --trace`). **A record is not a gate** — that is for looking back afterwards, not for stopping anything.
 
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 

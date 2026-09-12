@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title DeepSeek Bridge - UNINSTALL
+title ModelBridge - UNINSTALL
 cd /d "%~dp0.."
 
 echo ============================================================
@@ -26,7 +26,7 @@ echo   Two more things you must do by hand
 echo ============================================================
 echo.
 echo 1) Delete the connector inside ChatGPT:
-echo    chatgpt.com - Settings - Plugins - MCP - remove deepseek-bridge
+echo    chatgpt.com - Settings - Plugins - MCP - remove modelbridge
 echo.
 echo 2) Revoke the API key in the DeepSeek console.
 echo    Deleting .env does NOT revoke the key.

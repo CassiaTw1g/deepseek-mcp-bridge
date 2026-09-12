@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title DeepSeek Bridge - STATUS
+title ModelBridge - STATUS
 cd /d "%~dp0.."
 
 call npm run status

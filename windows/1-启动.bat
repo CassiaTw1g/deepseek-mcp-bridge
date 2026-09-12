@@ -1,10 +1,10 @@
 @echo off
 chcp 65001 >nul
-title DeepSeek Bridge - START
+title ModelBridge - START
 cd /d "%~dp0.."
 
 echo ============================================================
-echo   Starting DeepSeek Bridge
+echo   Starting ModelBridge
 echo ============================================================
 echo.
 

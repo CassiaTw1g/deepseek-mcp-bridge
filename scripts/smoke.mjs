@@ -9,6 +9,7 @@
  *
  * Run: npm run smoke            (picks the URL up from the running tunnel)
  *      npm run smoke -- https://xxxx.trycloudflare.com
+ *      npm run smoke -- https://mcp.example.com     (named tunnel)
  */
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -27,8 +28,20 @@ function readEnv() {
   return out;
 }
 
-/** Only the current tunnel section — the log is appended across restarts. */
+/**
+ * Where the connector should be pointing.
+ *
+ * A named tunnel's hostname is configured, not discovered — cloudflared never
+ * prints a `*.trycloudflare.com` line for one, so scraping the log (which is the
+ * only way to learn a quick tunnel's address) would return null forever and this
+ * script would report "no address" against a perfectly good named tunnel.
+ * `TUNNEL_HOSTNAME` wins when set, for the same reason it wins in `ctl`.
+ */
 function tunnelUrl() {
+  if ((env.TUNNEL_MODE ?? "").trim().toLowerCase() === "named") {
+    const host = (env.TUNNEL_HOSTNAME ?? "").trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+    if (host) return `https://${host}`;
+  }
   const file = join(ROOT, ".state", "tunnel.log");
   if (!existsSync(file)) return null;
   const body = readFileSync(file, "utf8");
@@ -118,7 +131,7 @@ const init = await rpc({
 });
 check(
   "initialize 成功",
-  init?.result?.serverInfo?.name === "deepseek-bridge",
+  init?.result?.serverInfo?.name === "modelbridge",
   JSON.stringify(init?.result?.serverInfo ?? init),
 );
 

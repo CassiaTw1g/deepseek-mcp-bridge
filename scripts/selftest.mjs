@@ -126,7 +126,7 @@ const init = await rpc({
 });
 check(
   "initialize 成功",
-  init?.result?.serverInfo?.name === "deepseek-bridge",
+  init?.result?.serverInfo?.name === "modelbridge",
   JSON.stringify(init?.result?.serverInfo ?? init),
 );
 
