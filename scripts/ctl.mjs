@@ -2,9 +2,9 @@
 /**
  * Lifecycle manager for the modelbridge plugin.
  *
- * start / stop / restart / reload / status / enable / disable / logs / uninstall
- * secret / rotate / url / tunnel / untunnel / allow / jobs / pending / approve /
- * deny / audit / auto
+ * setup / start / stop / restart / reload / status / enable / disable / logs /
+ * uninstall / secret / rotate / url / tunnel / untunnel / allow / jobs /
+ * pending / approve / deny / audit / auto
  *
  * `reload` restarts the server alone; `restart` also restarts the tunnel. With a
  * quick tunnel that changes the public URL; with a named one it does not.
@@ -27,6 +27,28 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AUTO_APPROVE_FLAG, auditEvent, decide, isApprovalOff, listPending } from "../src/agent/approvals.ts";
 import { readJobSnapshots } from "../src/agent/jobs.ts";
+// The wizard's text, language detection and probe parsing. Deliberately a plain
+// `.mjs` with no imports beyond node builtins: `npm run setup` has to work on a
+// fresh clone, before `npm install`, and the two modules above are the only
+// reason this file itself can. `src/harness/claude-code.ts` cannot be imported
+// here for the same reason — it pulls in the MCP SDK.
+import {
+  CLAUDE_BIN_RELATIVE,
+  PROVIDER_PRESETS,
+  anthropicBase,
+  classifyProbe,
+  claudeExeName,
+  detectLang,
+  keySummary,
+  looksLikeHost,
+  looksLikeHttpUrl,
+  messagesUrl,
+  normalizeHost,
+  normalizeLang,
+  probeUsable,
+  shortDetail,
+  t,
+} from "./setup.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const ENTRY = join(ROOT, "src", "server.ts");
@@ -256,6 +278,43 @@ async function probePublicHealth(url, timeoutMs = 20_000) {
   return { ok: false, detail: last };
 }
 
+/**
+ * Wait until the port is actually answering, on loopback.
+ *
+ * `isAlive(pid)` is not the same question. `npm start` spawns a shell, and the
+ * shell outlives the node process it launched: when `src/server.ts` dies at boot
+ * — a missing dependency, a malformed `.env`, a port already taken — the PID in
+ * `.state/server.pid` stays alive and `currentStatus()` reports a healthy
+ * service. Observed for real on 2026-09-12, in the wizard's own end-to-end test:
+ * it printed a public URL and copied it to the clipboard while the server behind
+ * it was already dead.
+ *
+ * That is the worst shape this failure can take, because the tunnel comes up
+ * fine and the operator's only symptom is ChatGPT failing to connect — which
+ * looks like a ChatGPT problem. A tunnel in front of a dead port can never work,
+ * so this is worth refusing on.
+ *
+ * Loopback only, deliberately: the caveat on `probePublicHealth` about proxy
+ * hairpins does not apply to a request that never leaves the machine.
+ */
+async function waitForLocalHealth(port, timeoutMs = 20_000) {
+  const url = `http://127.0.0.1:${port}/health`;
+  const deadline = Date.now() + timeoutMs;
+  let last = "未尝试";
+  do {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+      if (res.ok) return { ok: true, detail: `HTTP ${res.status}` };
+      last = `HTTP ${res.status}`;
+    } catch (err) {
+      const name = err?.name ?? "";
+      last = name === "TimeoutError" || name === "AbortError" ? "超时" : (err?.cause?.message ?? err?.message ?? String(err));
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  } while (Date.now() < deadline);
+  return { ok: false, detail: last };
+}
+
 function isAlive(pid) {
   if (!pid) return false;
   try {
@@ -313,8 +372,15 @@ function mask(text) {
   // machine, it is handed to a *third-party binary's* command line, and any
   // diagnostic that dumps argv (`--loglevel debug`, a crash report, a process
   // listing) would otherwise put it straight into whatever file we printed to.
+  //
+  // `DEEPSEEK_API_KEY` is the third, and it is here for a different reason: it
+  // is the one credential the *wizard* handles, and an API error body can quote
+  // the request back. `scrubEnv` already keeps it out of the sub-agent's
+  // environment, so this is defence in depth rather than the only wall — but a
+  // wizard that prints its own verification response is exactly where a key
+  // would otherwise end up in a scrollback a stranger is reading.
   const env = parseEnvFile();
-  for (const key of ["MCP_PATH_SECRET", "TUNNEL_TOKEN"]) {
+  for (const key of ["MCP_PATH_SECRET", "TUNNEL_TOKEN", "DEEPSEEK_API_KEY"]) {
     const value = process.env[key] || env[key] || "";
     // The length floor is about false positives, not safety: a one-character
     // value would turn every occurrence of that character into noise.
@@ -482,6 +548,24 @@ async function cmdTunnel() {
   const env = { ...process.env, ...state.env };
   const port = env.PORT ?? "8787";
   const named = tunnelMode(env) === "named";
+
+  // Before publishing anything: is there a server on that port? See
+  // `waitForLocalHealth` — a live PID is not the same thing, and a tunnel in
+  // front of a dead port produces a URL that fails in a way that looks like
+  // ChatGPT's fault. Generous timeout because `start` returns as soon as the
+  // process is spawned, not when it is listening.
+  process.stdout.write("服务检查 : 本机端口是否应答");
+  const local = await waitForLocalHealth(port);
+  console.log(local.ok ? ` … 通 (${local.detail})` : ` … 不通 (${local.detail})`);
+  if (!local.ok) {
+    console.error("");
+    console.error(`⚠️  没有开隧道:\`127.0.0.1:${port}\` 上没有服务在应答,隧道接上去也是白接。`);
+    console.error("    （`.state/server.pid` 里的进程活着,不代表服务活着 —— `npm start` 包了一层 shell。）");
+    console.error("");
+    console.error(`    先看它为什么没起来:${LOG_FILE}`);
+    console.error("    再试:npm start(前台跑一次,报错会直接打在屏幕上)");
+    process.exit(1);
+  }
 
   if (named) {
     const problems = namedConfigProblems(env);
@@ -1328,15 +1412,164 @@ function writeRoots(roots) {
  * of the command, and `npm run` prints the whole invocation back. This is not a
  * hidden prompt — the terminal echoes what you paste, same as pasting it into an
  * editor would — but it stays out of the process list and out of npm's output.
+ *
+ * Resolves `null` when stdin ends without a line. readline's question callback
+ * simply never fires at EOF, so without this a wizard in a pipeline
+ * (`npm run setup < /dev/null`, a redirected file, CI) would sit there forever
+ * with nothing on screen — and a hang reads as "slow", so the operator waits.
  */
 function ask(question) {
   return new Promise((resolve) => {
     const rl = createInterface({ input: process.stdin, output: process.stderr });
-    rl.question(question, (answer) => {
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
       rl.close();
-      resolve(answer.trim());
-    });
+      resolve(value);
+    };
+    rl.question(question, (answer) => done(answer.trim()));
+    rl.on("close", () => done(null));
   });
+}
+
+
+/**
+ * The wizard's line reader.
+ *
+ * Deliberately *not* readline, and deliberately one instance for the whole run.
+ * `readline.createInterface` reads ahead into its own buffer, so a second
+ * interface opened after the first is closed starts with whatever was left on
+ * the pipe already gone — which is invisible interactively (a person types one
+ * line at a time) and fatal to a piped run, where every remaining answer
+ * vanishes after the first question. Owning the buffer here means the second
+ * question gets the second line.
+ *
+ * It also has to own the terminal, because one question in this wizard is a
+ * credential: raw mode plus a per-question echo flag is how "show me what I type
+ * for the hostname, show me asterisks for the API key" is done without reaching
+ * for readline's private `_writeToOutput`.
+ *
+ * Raw mode is a property of the *console*, not of this process, so `close()` on
+ * `process.on("exit")` is not tidiness — without it a Ctrl+C or a normal exit
+ * leaves the operator's shell with no line editing and no echo.
+ */
+class Terminal {
+  constructor(input = process.stdin, output = process.stderr) {
+    this.input = input;
+    this.output = output;
+    // A pipe cannot be put in raw mode and echoes nothing anyway, so the same
+    // code path serves an interactive terminal and a scripted one.
+    this.tty = Boolean(input.isTTY) && typeof input.setRawMode === "function";
+    this.queue = [];
+    this.waiter = null;
+    this.buffer = "";
+    this.echo = true;
+    this.inEscape = false;
+    this.lastWasCr = false;
+    this.ended = false;
+
+    this.onData = (chunk) => this.#feed(String(chunk));
+    this.onEnd = () => this.#end();
+
+    if (this.tty) input.setRawMode(true);
+    input.setEncoding?.("utf8");
+    input.resume();
+    input.on("data", this.onData);
+    input.on("end", this.onEnd);
+    input.on("close", this.onEnd);
+  }
+
+  #feed(chunk) {
+    for (const ch of chunk) {
+      if (this.inEscape) {
+        // An escape run ends on a final byte in @–~ — `[200~`, `[A`, `OA`.
+        if (ch >= "@" && ch <= "~") this.inEscape = false;
+        continue;
+      }
+      if (ch === "\u001b") {
+        this.inEscape = true;
+        continue;
+      }
+      // CRLF: one line, not two. Only matters for piped input; a terminal in
+      // raw mode sends CR alone.
+      if (ch === "\n" && this.lastWasCr) {
+        this.lastWasCr = false;
+        continue;
+      }
+      this.lastWasCr = ch === "\r";
+      if (ch === "\r" || ch === "\n") {
+        this.#complete();
+        continue;
+      }
+      if (ch === "\u0003") {
+        // Ctrl+C. Raw mode took it away from the terminal, so honour it here.
+        this.output.write("\n");
+        process.exit(130);
+      }
+      if (ch === "\u007f" || ch === "\b") {
+        if (this.buffer) {
+          this.buffer = this.buffer.slice(0, -1);
+          if (this.tty) this.output.write("\b \b");
+        }
+        continue;
+      }
+      if (ch < " ") continue; // any other control character
+      this.buffer += ch;
+      if (this.tty) this.output.write(this.echo ? ch : "*");
+    }
+  }
+
+  #complete() {
+    const line = this.buffer.trim();
+    this.buffer = "";
+    if (this.waiter) {
+      const resolve = this.waiter;
+      this.waiter = null;
+      resolve(line);
+    } else {
+      this.queue.push(line);
+    }
+  }
+
+  #end() {
+    this.ended = true;
+    if (this.waiter) {
+      const resolve = this.waiter;
+      this.waiter = null;
+      resolve(null);
+    }
+  }
+
+  /** One line, or null once stdin has ended. `echo: false` masks what is typed. */
+  read(prompt, { echo = true } = {}) {
+    if (prompt) this.output.write(prompt);
+    if (this.queue.length > 0) return Promise.resolve(this.queue.shift());
+    if (this.ended) return Promise.resolve(null);
+    this.echo = echo;
+    return new Promise((resolve) => {
+      this.waiter = resolve;
+    }).then((line) => {
+      this.echo = true;
+      return line;
+    });
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    this.input.removeListener("data", this.onData);
+    this.input.removeListener("end", this.onEnd);
+    this.input.removeListener("close", this.onEnd);
+    if (this.tty) {
+      try {
+        this.input.setRawMode(false);
+      } catch {
+        /* the console may already be gone */
+      }
+    }
+    this.input.pause();
+  }
 }
 
 /**
@@ -1492,11 +1725,591 @@ function cmdAllow(args) {
   cmdReload();
 }
 
+// --- 首次安装向导 -----------------------------------------------------------
+
+/**
+ * Where the Claude Code CLI is, or null.
+ *
+ * Mirrors `resolveBin` in `src/harness/claude-code.ts` — same two homes, same
+ * `claude.exe` on Windows — and then looks on PATH, which the harness does not
+ * have to because it can shell out to a bare name. The list itself lives in
+ * `setup.mjs` so `test-setup.mjs` can check it against that file; this function
+ * is the part that touches the disk.
+ */
+function findClaudeBin() {
+  const explicit = process.env.BRIDGE_CLAUDE_BIN || parseEnvFile().BRIDGE_CLAUDE_BIN || "";
+  if (explicit && existsSync(explicit)) return explicit;
+
+  const home = process.env.USERPROFILE ?? process.env.HOME ?? "";
+  const exe = claudeExeName();
+  if (home) {
+    for (const relative of CLAUDE_BIN_RELATIVE) {
+      const candidate = join(home, ...relative.split("/"), exe);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+
+  try {
+    const probe = spawnSync(isWindows ? "where" : "which", [exe], { encoding: "utf8" });
+    if (probe.status === 0) {
+      const first = String(probe.stdout ?? "").split(/\r?\n/).find((line) => line.trim());
+      if (first) return first.trim();
+    }
+  } catch {
+    /* PATH lookup is a convenience, not a requirement */
+  }
+  return null;
+}
+
+/**
+ * The wizard's terminal.
+ *
+ * One `Terminal` for the whole run — that is the entire point of the class — and
+ * the wizard's interactive helpers below are its only callers. Installing it
+ * here rather than threading it through forty call sites keeps `cmdSetup`
+ * readable; `term()` failing loudly is what stops a later caller from quietly
+ * opening a second reader and re-introducing the piped-input bug.
+ */
+let ACTIVE_TERM = null;
+
+function term() {
+  if (!ACTIVE_TERM) {
+    throw new Error("内部错误:向导终端未安装(这些提问函数只能在 cmdSetup 里调用)");
+  }
+  return ACTIVE_TERM;
+}
+
+/** Print a message, block or single line, in `lang`. */
+function sayLines(lang, key, vars) {
+  const value = t(lang, key, vars);
+  for (const line of Array.isArray(value) ? value : [value]) console.log(line);
+}
+
+/**
+ * Print a block and return its last line — the question.
+ *
+ * Prompts and explanations are the same message in different shapes: the table
+ * stores a block, and the question is whatever comes last. That keeps "what you
+ * are being asked" adjacent to "why" in one place, in both languages.
+ */
+function askLine(lang, key, vars) {
+  const value = t(lang, key, vars);
+  const lines = Array.isArray(value) ? value : [value];
+  for (const line of lines.slice(0, -1)) console.log(line);
+  return `${lines[lines.length - 1]} `;
+}
+
+/** Print a block and ask with its last line. Returns null at EOF. */
+async function askPrompt(lang, key, vars, { echo = true } = {}) {
+  return term().read(askLine(lang, key, vars), { echo });
+}
+
+/**
+ * One question, kept in a loop until the answer passes.
+ *
+ * `check` returns null when the answer is good, or `{key, vars}` naming the
+ * message that explains what is wrong — so every rejection re-asks instead of
+ * exiting, which matters because the wizard writes to `.env` as it goes and
+ * quitting on a typo would leave the operator re-answering everything.
+ *
+ * `hidden` masks what is typed, for the one answer that is a credential. It is
+ * a screen-level courtesy, not a security boundary: the value is still in this
+ * process's memory, and in whatever the operator pasted it from.
+ *
+ * Returns null at EOF, which every caller turns into an abort.
+ */
+async function askUntil({ hidden = false, promptKey, check, lang, vars }) {
+  for (;;) {
+    const raw = await askPrompt(lang, promptKey, vars, { echo: !hidden });
+    if (raw === null) return null;
+    const problem = check(raw);
+    if (!problem) return raw.trim();
+    sayLines(lang, problem.key, problem.vars);
+  }
+}
+
+/**
+ * A numbered menu. Returns the chosen value, or null at EOF.
+ *
+ * Enter takes the default; the option's own key (`quick`, `named`) is accepted
+ * too, for anyone who reads the source instead of the screen.
+ */
+async function askChoice(lang, items, defaultIndex = 0) {
+  for (;;) {
+    console.log("");
+    items.forEach(([, label], i) => console.log(`  ${i + 1}) ${label}`));
+    const raw = await askPrompt(lang, "q.choose", { options: `1-${items.length}` });
+    if (raw === null) return null;
+    const answer = raw.trim().toLowerCase();
+    if (!answer) return items[defaultIndex][0];
+    const byKey = items.find(([key]) => key === answer);
+    if (byKey) return byKey[0];
+    const index = Number.parseInt(answer, 10);
+    if (Number.isInteger(index) && index >= 1 && index <= items.length) return items[index - 1][0];
+    sayLines(lang, "invalid.choose", { options: `1-${items.length}` });
+  }
+}
+
+/**
+ * Ask the configured endpoint whether it will actually answer.
+ *
+ * The wizard exists because the failure this catches is invisible: a truncated
+ * key, a base URL missing a path segment, or a model name the endpoint does not
+ * know all produce a `.env` that looks complete, a service that starts cleanly,
+ * and a connector in ChatGPT that only fails once somebody asks it something.
+ * One request here costs a few tokens and moves that discovery to the person
+ * who can still fix it.
+ *
+ * Provisional by construction: the service is not running yet, so this cannot
+ * go through the bridge. It speaks to the endpoint directly, with the same URL
+ * the harness will derive and the same credential header.
+ */
+async function probeModel({ base, override, model, key }) {
+  const url = messagesUrl(anthropicBase(base, override));
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 4,
+        messages: [{ role: "user", content: "ping" }],
+      }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const text = await res.text().catch(() => "");
+    return { code: classifyProbe(res.status), status: res.status, detail: shortDetail(text) };
+  } catch (err) {
+    const name = err?.name ?? "";
+    const detail =
+      name === "TimeoutError" || name === "AbortError"
+        ? "30 秒没有响应 / no response in 30s"
+        : (err?.cause?.message ?? err?.message ?? String(err));
+    return { code: "network", status: 0, detail: shortDetail(detail) };
+  }
+}
+
+/**
+ * `npm run setup` — the first-run wizard.
+ *
+ * Everything it writes goes through `writeEnvKey`, so it edits `.env` line by
+ * line and never reflows somebody's comments; everything it prints goes through
+ * `mask`, so a key or a path secret cannot reach the screen even by accident;
+ * and the two steps that touch the running system — `cmdStart` and `cmdTunnel`
+ * — are the same functions `npm start` and `npm run tunnel` call. A wizard that
+ * reimplemented any of those would be a second copy of a security rule.
+ *
+ * It is resumable by construction: each answer is written as it is given, so
+ * Ctrl+C halfway leaves a usable `.env` and a rerun skips nothing it should not.
+ */
+async function cmdSetup(args) {
+  const explicitLang = args.lang;
+  if (explicitLang && !normalizeLang(explicitLang)) {
+    console.error(`--lang 只认 zh 和 en(收到 "${explicitLang}")。/ --lang accepts zh or en.`);
+    process.exit(1);
+  }
+  const lang = detectLang({
+    explicit: explicitLang,
+    env: process.env.BRIDGE_LANG,
+    locale: Intl.DateTimeFormat().resolvedOptions().locale,
+  });
+
+  // One reader for the whole run, closed on every exit path — including Ctrl+C
+  // and `process.exit`. Raw mode belongs to the console rather than to this
+  // process, so without this the operator's shell is left with no echo and no
+  // line editing after the wizard ends, which looks like a broken terminal.
+  const terminal = new Terminal();
+  ACTIVE_TERM = terminal;
+  process.on("exit", () => terminal.close());
+
+  /** EOF anywhere means "stop", not "keep asking". */
+  const abort = (key) => {
+    console.log("");
+    sayLines(lang, key);
+    process.exit(1);
+  };
+
+  console.log("");
+  sayLines(lang, "banner.title");
+  console.log("=".repeat(62));
+  sayLines(lang, "banner.intro");
+  console.log("");
+
+  // --- prerequisite: dependencies -------------------------------------------
+  //
+  // First, because the wizard itself does not need them (it imports node
+  // builtins and two dependency-free modules) but nothing downstream works
+  // without them. Being runnable on a bare clone is the whole reason that is
+  // true, and it is worth keeping that way.
+  if (!existsSync(join(ROOT, "node_modules"))) {
+    sayLines(lang, "dep.missing");
+    const answer = await askPrompt(lang, "dep.ask");
+    if (answer === null) abort("abort.eof");
+    if (!/^n/i.test(answer.trim())) {
+      console.log("");
+      sayLines(lang, "dep.running");
+      const npm = isWindows ? "npm.cmd" : "npm";
+      const installed = spawnSync(npm, ["install"], { cwd: ROOT, stdio: "inherit", shell: isWindows });
+      if (installed.status !== 0) {
+        console.log("");
+        sayLines(lang, "dep.failed");
+        process.exit(1);
+      }
+    } else {
+      sayLines(lang, "dep.skipped");
+    }
+  }
+
+  // --- .env must exist before anything is written to it ---------------------
+  //
+  // Copied from the template so the operator keeps every explanatory comment,
+  // then the two placeholder values are blanked at once. That second step is
+  // the point: `.env.example` ships `sk-your-new-key-here`, which `preflight`
+  // accepts as a well-formed key, so an abandoned first run would otherwise
+  // leave a configuration that starts cleanly and fails at the first question.
+  if (!existsSync(ENV_FILE)) {
+    const template = join(ROOT, ".env.example");
+    writeFileSync(ENV_FILE, existsSync(template) ? readFileSync(template, "utf8") : "", "utf8");
+    writeEnvKey("DEEPSEEK_API_KEY", "");
+    writeEnvKey("MCP_PATH_SECRET", "");
+  }
+
+  // --- [1/5] model and key --------------------------------------------------
+  let providerBase;
+  let providerModel;
+  let apiKey;
+
+  for (;;) {
+    console.log("");
+    sayLines(lang, "q.model.title");
+    sayLines(lang, "q.model.explain");
+
+    const provider = await askChoice(lang, [
+      ["deepseek", t(lang, "q.model.option1")],
+      ["custom", t(lang, "q.model.option2")],
+    ]);
+    if (provider === null) abort("abort.eof");
+
+    providerBase = PROVIDER_PRESETS.deepseek.base;
+    providerModel = PROVIDER_PRESETS.deepseek.model;
+
+    if (provider === "custom") {
+      const rawBase = await askUntil({
+        lang,
+        promptKey: "q.model.base",
+        check: (value) => (looksLikeHttpUrl(value) ? null : { key: "q.model.baseBad" }),
+      });
+      if (rawBase === null) abort("abort.eof");
+      // DeepSeek's own docs print the endpoint as `…/anthropic`, so people type
+      // it. That layer is added by the harness (see `anthropicBase`), and
+      // leaving it in would send every request to `…/anthropic/anthropic`.
+      providerBase = rawBase.replace(/\/+$/, "");
+      if (/\/anthropic$/i.test(providerBase)) {
+        providerBase = providerBase.replace(/\/anthropic$/i, "");
+        sayLines(lang, "q.model.baseStripped");
+      }
+      if (!providerBase) {
+        sayLines(lang, "q.model.baseBad");
+        continue;
+      }
+
+      const rawModel = await askUntil({
+        lang,
+        promptKey: "q.model.model",
+        check: (value) => (value.trim() ? null : { key: "q.model.modelBad" }),
+      });
+      if (rawModel === null) abort("abort.eof");
+      providerModel = rawModel;
+    }
+
+    // --- the key, and the one request that proves it ------------------------
+    let retry = true;
+    while (retry) {
+      retry = false;
+      const raw = await askUntil({
+        hidden: true,
+        lang,
+        promptKey: "q.model.apikey",
+        check: (value) => (value.trim() ? null : { key: "q.model.apikeyEmpty" }),
+      });
+      if (raw === null) abort("abort.eof");
+      apiKey = raw;
+      if (!keySummary(apiKey).looksDeepSeek) sayLines(lang, "q.model.apikeyShape");
+
+      console.log("");
+      sayLines(lang, "q.model.probing");
+      const result = await probeModel({
+        base: providerBase,
+        override: parseEnvFile().BRIDGE_ANTHROPIC_BASE_URL,
+        model: providerModel,
+        key: apiKey,
+      });
+
+      if (probeUsable(result.code)) {
+        sayLines(lang, "q.model.ok", { model: providerModel });
+        break;
+      }
+
+      sayLines(lang, `q.model.${result.code}`, {
+        status: result.status,
+        detail: mask(result.detail),
+        model: providerModel,
+      });
+      // The body is the only thing that distinguishes "bad model name" from
+      // "bad request shape", and both arrive as 400. Through `mask` because it
+      // is a string this process did not write: endpoints do quote the request
+      // back, including its headers.
+      if (result.detail && result.code !== "network") {
+        sayLines(lang, "q.model.detail", { detail: mask(result.detail) });
+      }
+
+      console.log("");
+      const choice = await askChoice(lang, [
+        ["retry", t(lang, "q.model.retry1")],
+        ["keep", t(lang, "q.model.retry2")],
+        ["quit", t(lang, "q.model.retry3")],
+      ]);
+      if (choice === null || choice === "quit") abort("abort.cancel");
+      if (choice === "keep") {
+        sayLines(lang, "q.model.savedAnyway");
+        break;
+      }
+      retry = true;
+      // A retry re-asks the base URL and the model too, because a 404 is almost
+      // always the address — offering only the key would trap someone in a loop
+      // re-pasting a key that was never the problem.
+      break;
+    }
+    if (retry) continue; // back to the top of [1/5]
+    break;
+  }
+
+  writeEnvKey("DEEPSEEK_API_KEY", apiKey);
+  writeEnvKey("DEEPSEEK_BASE_URL", providerBase);
+  writeEnvKey("DEEPSEEK_MODEL", providerModel);
+  sayLines(lang, "q.model.saved", { length: keySummary(apiKey).length });
+
+  // --- [2/5] harness --------------------------------------------------------
+  console.log("");
+  sayLines(lang, "q.harness.title");
+  sayLines(lang, "q.harness.explain");
+  const claudeBin = findClaudeBin();
+  if (claudeBin) {
+    sayLines(lang, "q.harness.found", { path: claudeBin });
+  } else {
+    console.log("");
+    sayLines(lang, "q.harness.missing");
+    const answer = await askPrompt(lang, "q.harness.askPath");
+    if (answer === null) abort("abort.eof");
+    const typed = answer.trim().replace(/^["']|["']$/g, "");
+    if (!typed) {
+      sayLines(lang, "q.harness.skip");
+    } else if (existsSync(resolve(typed))) {
+      const path = resolve(typed);
+      writeEnvKey("BRIDGE_CLAUDE_BIN", path);
+      sayLines(lang, "q.harness.pathSaved", { path });
+    } else {
+      sayLines(lang, "q.harness.pathBad", { path: resolve(typed) });
+    }
+  }
+
+  // --- [3/5] workspace roots -----------------------------------------------
+  //
+  // Asked before the tunnel, because it decides what is being published: with
+  // an empty list the URL is a question-and-answer endpoint, and with a root in
+  // it the URL is a shell on this machine. The two are not variations of the
+  // same thing, and the operator should choose the first one deliberately.
+  console.log("");
+  sayLines(lang, "q.roots.title");
+  sayLines(lang, "q.roots.explain");
+  const rootsBefore = readRoots();
+  const rootAnswer = await askPrompt(lang, "q.roots.ask");
+  if (rootAnswer === null) abort("abort.eof");
+  const typedRoot = rootAnswer.trim().replace(/^["']|["']$/g, "");
+  if (!typedRoot) {
+    // Enter means "I am not adding one", not "make it read-only". Saying
+    // "staying read-only" over a `.env` that still lists three directories
+    // would be a lie the operator has no way to catch — the roots list is not
+    // shown anywhere else in this run, and append-never-replace is deliberate.
+    if (rootsBefore.length > 0) sayLines(lang, "q.roots.keep", { roots: rootsBefore.join(" ; ") });
+    else sayLines(lang, "q.roots.skip");
+  } else {
+    const root = resolve(typedRoot);
+    const danger = dangerousRoot(root);
+    if (danger) {
+      sayLines(lang, "q.roots.danger", { path: root, what: danger });
+    } else if (!existsSync(root)) {
+      sayLines(lang, "q.roots.notfound", { path: root });
+    } else {
+      // Appended, never replacing: `.env` may already carry roots the operator
+      // added with `ctl allow`, and a wizard run must not be how those vanish.
+      const roots = readRoots();
+      const already = roots.some((r) => resolve(r).toLowerCase() === root.toLowerCase());
+      if (!already) writeRoots([...roots, root]);
+      sayLines(lang, "q.roots.added", { roots: readRoots().join(" ; ") });
+      sayLines(lang, "q.roots.warn");
+    }
+  }
+
+  // --- [4/5] tunnel ---------------------------------------------------------
+  console.log("");
+  sayLines(lang, "q.tunnel.title");
+  sayLines(lang, "q.tunnel.explain");
+  const mode = await askChoice(lang, [
+    ["quick", t(lang, "q.tunnel.option1")],
+    ["named", t(lang, "q.tunnel.option2")],
+  ]);
+  if (mode === null) abort("abort.eof");
+
+  if (mode === "quick") {
+    writeEnvKey("TUNNEL_MODE", "quick");
+    console.log("");
+    sayLines(lang, "q.tunnel.quick");
+  } else {
+    console.log("");
+    const host = await askUntil({
+      lang,
+      promptKey: "q.tunnel.host",
+      check: (value) => (looksLikeHost(value) ? null : { key: "q.tunnel.hostBad", vars: { host: value.trim() } }),
+    });
+    if (host === null) abort("abort.eof");
+
+    console.log("");
+    sayLines(lang, "q.tunnel.tokenExplain");
+    const token = await askUntil({
+      hidden: true,
+      lang,
+      promptKey: "q.tunnel.tokenAsk",
+      check: (value) =>
+        value.trim().length >= 40 ? null : { key: "q.tunnel.tokenShort", vars: { n: value.trim().length } },
+    });
+    if (token === null) abort("abort.eof");
+
+    const cleanHost = normalizeHost(host);
+    writeEnvKey("TUNNEL_MODE", "named");
+    writeEnvKey("TUNNEL_HOSTNAME", cleanHost);
+    writeEnvKey("TUNNEL_TOKEN", token);
+    console.log("");
+    sayLines(lang, "q.tunnel.saved", { host: cleanHost });
+
+    // The step that is not on this machine, and the reason a healthy named
+    // tunnel can still 404. Said here, where the operator is still reading,
+    // rather than left to be discovered in ChatGPT.
+    const [sub, ...domainParts] = cleanHost.split(".");
+    console.log("");
+    sayLines(lang, "q.tunnel.dnsNote", {
+      sub,
+      domain: domainParts.join("."),
+      port: parseEnvFile().PORT ?? "8787",
+    });
+  }
+
+  // --- [5/5] approval mode --------------------------------------------------
+  console.log("");
+  sayLines(lang, "q.approval.title");
+  sayLines(lang, "q.approval.explain");
+  const approvalAnswer = await askPrompt(lang, "q.approval.ask");
+  if (approvalAnswer === null) abort("abort.eof");
+  const wantAuto = /^y(es)?$/i.test(approvalAnswer.trim());
+  sayLines(lang, wantAuto ? "q.approval.on" : "q.approval.off");
+
+  // Every question is asked; the rest of the run is starting things and printing
+  // addresses. Hand the console back now rather than at exit, so the operator's
+  // shell has its echo and line editing back during the long part — and clear
+  // the reference, so a step that grew a question later would fail loudly
+  // instead of waiting forever on a terminal nobody is reading.
+  terminal.close();
+  ACTIVE_TERM = null;
+
+  // --- start ----------------------------------------------------------------
+  console.log("");
+  sayLines(lang, "start.title");
+
+  const envNow = parseEnvFile();
+  if (!envNow.MCP_PATH_SECRET || envNow.MCP_PATH_SECRET.length < 16) {
+    writeEnvKey("MCP_PATH_SECRET", randomBytes(32).toString("hex"));
+    sayLines(lang, "start.secret");
+  }
+
+  const problems = preflight();
+  if (problems.length > 0) {
+    sayLines(lang, "start.preflight");
+    for (const problem of problems) console.error(`  - ${problem}`);
+    console.log("");
+    sayLines(lang, "start.failed");
+    process.exit(1);
+  }
+
+  const state = currentStatus();
+  if (state.disabled) {
+    sayLines(lang, "start.enable");
+    cmdEnable();
+  }
+  if (state.running) {
+    // `.env` is read once, at boot. Everything above just changed it.
+    sayLines(lang, "start.reload");
+    cmdReload();
+  } else {
+    sayLines(lang, "start.local");
+    cmdStart();
+  }
+
+  console.log("");
+  sayLines(lang, "start.tunnel");
+  await cmdTunnel();
+
+  console.log("");
+  cmdUrl();
+
+  if (wantAuto) {
+    console.log("");
+    sayLines(lang, "start.autoOn");
+    // Deliberately after the server is up: `cmdAuto` refuses to write the flag
+    // while nothing is running, because boot clears it — so doing this earlier
+    // would report success and then silently do nothing.
+    cmdAuto({ positional: ["on"], flags });
+  }
+
+  console.log("");
+  console.log("=".repeat(62));
+  sayLines(lang, "done.title");
+  sayLines(lang, "done.steps");
+  console.log("");
+  sayLines(lang, "done.tools");
+  console.log("");
+  sayLines(lang, "done.later");
+  console.log("");
+  sayLines(lang, "done.safety");
+  console.log("=".repeat(62));
+}
+
 const [command, ...rest] = process.argv.slice(2);
 const flags = new Set(rest);
 const positional = rest.filter((a) => !a.startsWith("-"));
 
+/**
+ * The value of `--name value` or `--name=value`, or null.
+ *
+ * `positional` drops every dashed argument, which is right everywhere else and
+ * wrong for the one flag that takes a value: `setup --lang en` would otherwise
+ * leave a stray "en" in the positional list and lose the language.
+ */
+function flagValue(name) {
+  for (let i = 0; i < rest.length; i += 1) {
+    if (rest[i] === name) return rest[i + 1] ?? "";
+    if (rest[i].startsWith(`${name}=`)) return rest[i].slice(name.length + 1);
+  }
+  return null;
+}
+
 switch (command) {
+  case "setup":
+    await cmdSetup({ lang: flagValue("--lang") });
+    break;
   case "start":
     cmdStart({ foreground: flags.has("--foreground") || flags.has("-f") });
     break;
@@ -1574,6 +2387,10 @@ switch (command) {
     console.log(`modelbridge 生命周期管理
 
 用法: npm run <命令>
+
+  setup        首次安装向导:问模型 / API key / harness / 工作区 / 隧道 / 审批,
+               然后写 .env、启动服务、开隧道、把 connector 地址给你
+  setup --lang en|zh   向导用哪种语言(默认跟系统语言,认不出就用英文)
 
   start        后台启动服务(已运行时无操作)
   start --foreground   前台启动,便于调试

