@@ -586,7 +586,7 @@ async function cmdTunnel() {
 
   if (named) {
     // No `--url`: the route from hostname to local port lives in Cloudflare's
-    // remote config (the Public Hostname you set in the dashboard), not here.
+    // remote config (the route you published in the dashboard), not here.
     // Passing `--url` as well would fight that rather than help it.
     //
     // `--protocol` is honoured here (it is a hidden flag — see namedTunnelArgs),
@@ -757,7 +757,7 @@ function namedTunnelArgs(env) {
  * `tunnel check` — is a named tunnel configured well enough to try?
  *
  * Exists because the interesting failures here are silent. A wrong token or a
- * missing Public Hostname both produce a tunnel that looks alive on this end, and
+ * a missing published route both produce a tunnel that looks alive on this end, and
  * the operator finds out from ChatGPT. Catching the config-level half here is the
  * part that can actually be caught locally.
  */
@@ -848,7 +848,7 @@ async function cmdStatus() {
       console.log("             试试换传输协议:.env 里加 TUNNEL_PROTOCOL=quic(开 TUN)或 http2(直连),");
       console.log("             然后 `npm run ctl -- untunnel && npm run ctl -- tunnel`。");
     } else if (tunnelMode(state.env) === "named") {
-      console.log("           ↑ 固定域名还需要 Cloudflare 那边配了 Public Hostname 才会通");
+      console.log("           ↑ 固定域名还需要 Cloudflare 那边加一条路由才会通");
       console.log("             (本机查不到它做没做)。核对:`npm run ctl -- tunnel check`");
     }
   } else {
